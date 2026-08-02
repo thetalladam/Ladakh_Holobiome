@@ -1,0 +1,326 @@
+---
+title: "Moraine-pooled composition bar plots by source (16S Class / ITS Order, REVISION)"
+author: "Adam Ruka"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+## Overview
+
+Composition stacked bar plots for each **Sample.Type** (source), with samples **pooled by
+moraine age** (A, B, C). Uses the **full filtered phyloseq** objects created in
+`Microbe_explore.Rmd`, not the later core/shared-taxa subsets.
+
+| Marker | Taxonomic rank | Plotting method |
+|--------|----------------|-----------------|
+| 16S    | Class          | `microViz::comp_barplot()` (as in `Microbe_explore.Rmd`) |
+| ITS    | Order          | same |
+
+**Workflow (per source × marker):**
+
+1. Load the full filtered phyloseq objects and deduplicate by `Sample.Name`.
+2. Remove unclassified taxa at the display rank (16S: Class; ITS: Order).
+3. `phyloseq::tax_glom()` to Class (16S) or Order (ITS).
+4. `phyloseq::merge_samples()` — sum counts for each source × moraine combination.
+5. Call `comp_barplot()` once per marker, so every source uses the same global top-taxa
+   selection and colour mapping.
+6. Combine the 16S and ITS panels into one figure and export **SVG**.
+
+**Inputs**
+
+- `Molecular/ITS/La_Gla_final_16S.Rds` (or `Molecular/La_Gla_final_16S.Rds`)
+- `Molecular/ITS/La_Gla_final_ITS.Rds` (or `Molecular/La_Gla_final_ITS.Rds`)
+
+**Outputs**
+
+- `Molecular/Composition_moraine_pooled_REVISION/Composition_moraine_pooled_all_sources_REVISION.svg`
+- `Molecular/Composition_moraine_pooled_REVISION/Composition_moraine_pooled_sample_counts_REVISION.csv`
+
+```{r project-setup}
+if (!file.exists("Glacier Transects.Rproj") && file.exists("../Glacier Transects.Rproj")) {
+  setwd("..")
+}
+stopifnot("Open Glacier Transects.Rproj first" = file.exists("Glacier Transects.Rproj"))
+
+project_root <- normalizePath(getwd(), winslash = "/", mustWork = TRUE)
+molecular_dir <- normalizePath(file.path(project_root, "Molecular"), winslash = "/", mustWork = TRUE)
+out_dir <- file.path(molecular_dir, "Composition_moraine_pooled_REVISION")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+revision_tag <- "REVISION"
+n_taxa_display <- 15L
+merge_other <- FALSE
+
+source_levels <- c("Lichen", "Soil Crust", "Moss", "Bulk Soil", "Plant")
+moraine_levels <- c("A", "B", "C")
+moraine_labels <- c(
+  A = "Young (A)",
+  B = "Intermediate (B)",
+  C = "Old (C)"
+)
+
+suppressPackageStartupMessages({
+  library(phyloseq)
+  #library(speedyseq)
+  library(microViz)
+  library(ggplot2)
+  library(dplyr)
+  library(tidyr)
+  library(readr)
+  library(svglite)
+  library(patchwork)
+  library(knitr)
+  library(kableExtra)
+})
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+cat("Project root:", project_root, "\n")
+cat("Output dir:", out_dir, "\n")
+```
+
+```{r helpers}
+pick_existing_file <- function(candidates, label = "file") {
+  hits <- candidates[file.exists(candidates)]
+  if (length(hits) == 0) {
+    stop(
+      "Could not find ", label, ". Tried:\n",
+      paste0("  - ", candidates, collapse = "\n")
+    )
+  }
+  normalizePath(hits[[1]], winslash = "/", mustWork = FALSE)
+}
+
+source_to_slug <- function(x) {
+  x %>%
+    tolower() %>%
+    gsub("[^a-z0-9]+", "_", .) %>%
+    gsub("^_|_$", "", .)
+}
+
+sample_data_df <- function(ps) {
+  out <- as.data.frame(
+    as.matrix(phyloseq::sample_data(ps)),
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+  )
+  rownames(out) <- phyloseq::sample_names(ps)
+  out
+}
+
+set_sample_type_factor <- function(ps) {
+  meta <- sample_data_df(ps)
+  meta$Sample.Type <- factor(as.character(meta$Sample.Type), levels = source_levels)
+  sample_data(ps) <- sample_data(meta)
+  ps
+}
+
+dedupe_by_sample_name <- function(ps) {
+  meta <- sample_data_df(ps)
+  stopifnot("Sample.Name" %in% colnames(meta))
+  keep <- !duplicated(meta$Sample.Name)
+  prune_samples(rownames(meta)[keep], ps)
+}
+
+remove_unclassified_at_rank <- function(ps, taxrank) {
+  tt <- as.data.frame(as.matrix(tax_table(ps)), stringsAsFactors = FALSE)
+  stopifnot(taxrank %in% colnames(tt))
+  bad <- tt[[taxrank]] %in% c("Unclassified", "NA", "") | is.na(tt[[taxrank]])
+  prune_taxa(!bad, ps)
+}
+
+pool_phyloseq_by_source_moraine <- function(ps) {
+  meta <- sample_data_df(ps)
+  stopifnot(all(c("Sample.Type", "Moraine") %in% colnames(meta)))
+
+  meta$Sample.Type <- as.character(meta$Sample.Type)
+  meta$Moraine <- as.character(meta$Moraine)
+  keep <- meta$Sample.Type %in% source_levels & meta$Moraine %in% moraine_levels
+  ps <- prune_samples(rownames(meta)[keep], ps)
+  meta <- meta[keep, , drop = FALSE]
+
+  meta$Pool_ID <- paste(
+    source_to_slug(meta$Sample.Type),
+    meta$Moraine,
+    sep = "__"
+  )
+  sample_data(ps) <- sample_data(meta)
+  ps_pooled <- merge_samples(ps, "Pool_ID")
+
+  pool_lookup <- meta %>%
+    distinct(.data$Pool_ID, .data$Sample.Type, .data$Moraine) %>%
+    mutate(
+      Sample.Type = factor(.data$Sample.Type, levels = source_levels),
+      Moraine = factor(.data$Moraine, levels = moraine_levels),
+      Moraine_label = unname(moraine_labels[as.character(.data$Moraine)])
+    ) %>%
+    arrange(.data$Sample.Type, .data$Moraine)
+
+  pool_meta <- as.data.frame(pool_lookup)
+  rownames(pool_meta) <- pool_meta$Pool_ID
+  pool_meta <- pool_meta[sample_names(ps_pooled), , drop = FALSE]
+  sample_data(ps_pooled) <- sample_data(pool_meta)
+  ps_pooled
+}
+
+prepare_moraine_pooled_ps <- function(ps, taxrank) {
+  ps <- dedupe_by_sample_name(ps)
+  ps <- prune_taxa(taxa_sums(ps) > 0, ps)
+  ps <- remove_unclassified_at_rank(ps, taxrank)
+  ps <- tax_glom(ps, taxrank = taxrank, NArm = TRUE)
+  pool_phyloseq_by_source_moraine(ps)
+}
+
+comp_barplot_moraine_pooled <- function(
+    ps_pooled,
+    taxrank,
+    title_main
+) {
+  ps_pooled %>%
+    comp_barplot(
+      taxrank,
+      n_taxa = n_taxa_display,
+      merge_other = merge_other,
+      label = "Moraine_label"
+    ) +
+    facet_wrap(vars(Sample.Type), ncol = 1, scales = "free_y") +
+    coord_flip() +
+    labs(title = title_main, x = NULL, y = "Relative abundance") +
+    theme(
+      axis.ticks.y = element_blank(),
+      strip.text = element_text(face = "bold"),
+      legend.position = "right"
+    )
+}
+
+save_comp_svg <- function(plot_obj, file_path, width = 10, height = 6) {
+  ggsave(
+    filename = file_path,
+    plot = plot_obj,
+    width = width,
+    height = height,
+    device = svglite
+  )
+  invisible(file_path)
+}
+
+count_samples_by_source_moraine <- function(ps) {
+  sample_data_df(ps) %>%
+    transmute(
+      Sample.Type = as.character(.data$Sample.Type),
+      Moraine = as.character(.data$Moraine)
+    ) %>%
+    filter(
+      .data$Sample.Type %in% source_levels,
+      .data$Moraine %in% moraine_levels
+    ) %>%
+    count(.data$Sample.Type, .data$Moraine, name = "n_samples") %>%
+    complete(
+      Sample.Type = source_levels,
+      Moraine = moraine_levels,
+      fill = list(n_samples = 0L)
+    ) %>%
+    arrange(.data$Sample.Type, factor(.data$Moraine, levels = moraine_levels))
+}
+```
+
+```{r load-full-filtered}
+ps_16s_path <- pick_existing_file(
+  c(
+    file.path(molecular_dir, "ITS", "La_Gla_final_16S.Rds"),
+    file.path(molecular_dir, "La_Gla_final_16S.Rds")
+  ),
+  label = "full filtered 16S phyloseq RDS"
+)
+
+ps_its_path <- pick_existing_file(
+  c(
+    file.path(molecular_dir, "ITS", "La_Gla_final_ITS.Rds"),
+    file.path(molecular_dir, "La_Gla_final_ITS.Rds")
+  ),
+  label = "full filtered ITS phyloseq RDS"
+)
+
+La_Gla_16S_full <- readRDS(ps_16s_path) %>% set_sample_type_factor()
+La_Gla_ITS_full <- readRDS(ps_its_path) %>% set_sample_type_factor()
+
+cat("16S full filtered:", ps_16s_path, "\n")
+cat("ITS full filtered:", ps_its_path, "\n")
+cat("16S — samples:", nsamples(La_Gla_16S_full), "| taxa:", ntaxa(La_Gla_16S_full), "\n")
+cat("ITS — samples:", nsamples(La_Gla_ITS_full), "| taxa:", ntaxa(La_Gla_ITS_full), "\n")
+```
+
+## Sample counts before pooling
+
+```{r sample-counts}
+sample_counts <- bind_rows(
+  count_samples_by_source_moraine(La_Gla_16S_full) %>% mutate(marker = "16S"),
+  count_samples_by_source_moraine(La_Gla_ITS_full) %>% mutate(marker = "ITS")
+) %>%
+  relocate(.data$marker)
+
+write_csv(
+  sample_counts,
+  file.path(out_dir, sprintf("Composition_moraine_pooled_sample_counts_%s.csv", revision_tag))
+)
+
+sample_counts %>%
+  kable(caption = "Samples per source × moraine (before pooling)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## Composition plots
+
+Each marker is plotted from one pooled phyloseq object and one `comp_barplot()` call.
+Consequently, taxon colours and the top-15 selection are identical across all five
+sources within that marker. Bacterial classes and fungal orders have separate legends
+because they are different taxonomic sets.
+
+```{r plot-all-sources, fig.width=14, fig.height=28}
+ps_bac_pooled <- prepare_moraine_pooled_ps(La_Gla_16S_full, "Class")
+ps_fun_pooled <- prepare_moraine_pooled_ps(La_Gla_ITS_full, "Order")
+
+p_bac <- comp_barplot_moraine_pooled(
+  ps_bac_pooled,
+  "Class",
+  title_main = "A. Bacterial composition (Class)"
+)
+
+p_fun <- comp_barplot_moraine_pooled(
+  ps_fun_pooled,
+  "Order",
+  title_main = "B. Fungal composition (Order)"
+)
+
+p_combined <- p_bac / p_fun +
+  plot_annotation(
+    title = "Microbial composition across moraine ages by source",
+    subtitle = "Counts pooled across all samples within each source × moraine combination"
+  )
+
+combined_svg <- file.path(
+  out_dir,
+  sprintf("Composition_moraine_pooled_all_sources_%s.svg", revision_tag)
+)
+save_comp_svg(p_combined, combined_svg, width = 14, height = 28)
+print(p_combined)
+
+plot_index <- tibble(
+  figure = "Combined 16S Class + ITS Order",
+  n_pooled_bars_16S = nsamples(ps_bac_pooled),
+  n_pooled_bars_ITS = nsamples(ps_fun_pooled),
+  svg = combined_svg
+)
+write_csv(
+  plot_index,
+  file.path(out_dir, sprintf("Composition_moraine_pooled_plot_index_%s.csv", revision_tag))
+)
+
+plot_index %>%
+  kable(caption = "Exported composition SVGs") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```

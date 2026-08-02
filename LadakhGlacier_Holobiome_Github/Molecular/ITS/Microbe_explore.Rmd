@@ -1,0 +1,3152 @@
+---
+title: "Ladakh_Microbe_explore"
+author: "Adam Ruka"
+date: '2025-02-13'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+if (!file.exists("Glacier Transects.Rproj") && file.exists("../../Glacier Transects.Rproj")) setwd("../..")
+if (!file.exists("Glacier Transects.Rproj") && file.exists("../Glacier Transects.Rproj")) setwd("..")
+stopifnot("Open Glacier Transects.Rproj first" = file.exists("Glacier Transects.Rproj"))
+project_root <- normalizePath(getwd(), winslash = "/", mustWork = TRUE)
+molecular_dir <- file.path(project_root, "Molecular")
+
+library(NetCoMi)
+library(phyloseq)
+library(extrafont) # Tools for using fonts, CRAN v0.17
+library(kableExtra) # Construct Complex Table with 'kable' and Pipe Syntax
+library(tidyverse) # Easily Install and Load the 'Tidyverse', CRAN v1.3.0
+library(scales) # Generic plot scaling methods
+library(cowplot) # wrappers for ggplot
+library(magrittr) # A Forward-Pipe Operator for R, CRAN v2.0.1
+library(phyloseq) # Handling and analysis of high-throughput microbiome census data, Bioconductor v1.32.0
+#library(speedyseq) # Faster implementations of phyloseq functions, [github::mikemc/speedyseq] v0.5.3.9018 
+library(Biostrings) # Efficient manipulation of biological strings, Bioconductor v2.56.0
+library(svglite) # An 'SVG' Graphics Device, CRAN v1.2.3.2 
+library(vegan) # Community Ecology Package, CRAN v2.5-7
+library(see) # Visualisation Toolbox for 'easystats' and Extra Geoms, Themes and Color Palettes for 'ggplot2', CRAN v0.6.1 
+set.seed(1) # for reproducible stochastic processes
+library(ggplot2)
+library(patchwork) # for combining multiple plots
+library(microViz)
+library(dplyr)
+library(microbiome)
+library(tidyverse)
+library(readxl)
+library(readr)
+library(dplyr)
+library(writexl)
+library(openxlsx)
+library(ggrepel)
+library(raster)
+library(terra)
+library(dismo)
+library(sp)
+library(VennDiagram)
+library(ggvenn)
+library(lme4)
+library(car)
+library(emmeans)
+library(ARTool)
+library(multcompView)
+library(rcompanion)
+library(svglite)
+```
+
+## Basic analyses of alpha and beta diversity of bacterial and fungal communities from glacier transect study.
+# minimum library size of 1000 for fungi and bacteria
+# prevalence threshold of 1% (3 samples)
+
+
+##Load Phyloseq object
+
+```{r echo=FALSE}
+La_Gla_ITS <- readRDS(file.path(molecular_dir, "Ladakh_Glacier_ITS_tax_filt.Rds"))
+
+#tax_fix_interactive(La_Gla_ITS)
+# Calculate library size
+lib_size <- sample_sums(La_Gla_ITS)
+
+# Extract sample metadata
+metadata <- sample_data(La_Gla_ITS)
+
+# Convert to a data frame (if needed)
+metadata <- as.data.frame(metadata)
+
+# Add library size column
+metadata$Library_Size <- lib_size
+
+# Reassign updated metadata to the phyloseq object
+sample_data(La_Gla_ITS) <- sample_data(metadata)
+
+sample_data(La_Gla_ITS)
+
+tax_table(La_Gla_ITS)
+
+ITS_meta_var <- sample_variables(La_Gla_ITS)
+
+La_Gla_16S <- readRDS(file.path(molecular_dir, "Ladakh_Glacier_16S_tax_filt.Rds"))
+
+#tax_fix_interactive(La_Gla_16S)
+
+# Calculate library size
+lib_size <- sample_sums(La_Gla_16S)
+
+# Extract sample metadata
+metadata <- sample_data(La_Gla_16S)
+
+# Convert to a data frame (if needed)
+metadata <- as.data.frame(metadata)
+
+# Add library size column
+metadata$Library_Size <- lib_size
+
+# Reassign updated metadata to the phyloseq object
+sample_data(La_Gla_16S) <- sample_data(metadata)
+
+
+sample_data(La_Gla_16S)
+
+tax_table(La_Gla_16S)
+
+Bac_meta_var <- sample_variables(La_Gla_16S)
+
+match(ITS_meta_var, Bac_meta_var)
+
+#include snow in ITS metadata
+meta <-sample_data(La_Gla_ITS)
+meta$rownames <- rownames(meta)
+
+meta <- as.matrix(meta)
+meta <- as.data.frame(meta)
+
+plot_meta <- read_excel(file.path(project_root, "Glacier_Soil_Topo_merged.xlsx"))
+
+snow <- plot_meta %>% 
+  dplyr::select(Plot, Snow_1976, Moraine_x_ID, Moraine_num) %>%
+  mutate(Snow_1976 = as.numeric(Snow_1976))
+
+# Merge the two data frames by the "Plot" column
+meta <- meta %>%
+  mutate(Plot = as.character(Plot)) %>%
+  left_join(snow, by = "Plot")
+
+Meta_ITS <- meta
+
+rownames(meta) <- meta$rownames
+
+sample_data(La_Gla_ITS) <- meta
+
+
+#include snow in 16S metadata
+meta <-sample_data(La_Gla_16S)
+meta$rownames <- rownames(meta)
+
+meta <- as.matrix(meta)
+meta <- as.data.frame(meta)
+
+plot_meta <- read_excel(file.path(project_root, "Glacier_Soil_Topo_merged.xlsx"))
+
+snow <- plot_meta %>% 
+  dplyr::select(Plot, Snow_1976, Moraine_x_ID, Moraine_num) %>%
+  mutate(Snow_1976 = as.numeric(Snow_1976))
+
+# Merge the two data frames by the "Plot" column
+meta <- meta %>%
+  mutate(Plot = as.character(Plot)) %>%
+  left_join(snow, by = "Plot")
+
+Meta_16S <- meta
+
+rownames(meta) <- meta$rownames
+
+sample_data(La_Gla_16S) <- meta
+
+
+```
+
+
+
+## Removing controls and generating unique identifies for "Unclassified" taxa.
+
+```{r, min library size, echo=FALSE }
+La_Gla_clean_16S <- La_Gla_16S %>%
+  ps_filter(Control == "FALSE", .keep_all_taxa = TRUE) %>%
+  ps_dedupe(vars = "Sample.Name")
+  
+# Identify taxa that are NOT unclassified at the Phylum level
+keep_taxa <- !tax_table(La_Gla_clean_16S)[, "Phylum"] %in% c("Unclassified", "NA", "")
+
+# Subset the phyloseq object to keep only classified taxa
+La_Gla_clean_16S <- prune_taxa(keep_taxa, La_Gla_clean_16S)
+
+# Identify taxa that are NOT unclassified at the Phylum level
+keep_taxa <- !tax_table(La_Gla_clean_16S)[, "Kingdom"] %in% c("Unclassified", "Archaea", "")
+
+# Subset the phyloseq object to keep only classified taxa
+La_Gla_clean_16S <- prune_taxa(keep_taxa, La_Gla_clean_16S)
+
+# Number of taxa before filtering
+ntaxa(La_Gla_16S)
+
+# Number of taxa after filtering
+ntaxa(La_Gla_clean_16S)
+
+min_prevalence <- 0.01 # 10% of samples
+
+n_samples <- nsamples(La_Gla_clean_16S)
+prevalence_threshold <- min_prevalence * n_samples  
+# Convert to sample count
+
+
+
+# Create a logical table of presence/absence (1 = present, 0 = absent)
+taxa_presence <- otu_table(La_Gla_clean_16S) > 0
+
+# Count number of samples where each taxon is present
+taxa_prevalence <- rowSums(taxa_presence)
+
+
+# Identify taxa that meet the prevalence threshold
+keep_taxa <- taxa_names(La_Gla_clean_16S)[taxa_prevalence >= prevalence_threshold]
+
+# Subset the phyloseq object
+La_Gla_clean_16S_prev_filt <- prune_taxa(keep_taxa, La_Gla_clean_16S)
+
+
+# Number of taxa before filtering
+ntaxa(La_Gla_clean_16S)
+
+# Number of taxa after filtering
+ntaxa(La_Gla_clean_16S_prev_filt)
+
+#minimum library threshold
+min_threshold <- 1000
+
+# Identify samples that meet the threshold
+keep_samples <- sample_sums(La_Gla_clean_16S_prev_filt) >= min_threshold
+
+La_Gla_clean_16S_filt <- prune_samples(keep_samples, La_Gla_clean_16S_prev_filt)
+
+La_Gla_16S_genus <- tax_glom(La_Gla_clean_16S_filt, taxrank = "Genus")
+
+#tax_fix_interactive(La_Gla_16S_genus)
+
+taxa<- as.data.frame(tax_table(La_Gla_16S))
+
+#tax_fix_interactive(La_Gla_16S_genus)
+
+# La_Gla_16S_sp_renamed <- renameTaxa(La_Gla_clean_16S_filt,
+#                                   pat = "<name>",
+#                                   substPat = "<name>_<subst_name>(<subst_R>)",
+#                                   numDupli = "Species")
+
+La_Gla_16S_genus_renamed <- renameTaxa(La_Gla_16S_genus,
+                                  pat = "<name>",
+                                  substPat = "<name>_<subst_name>(<subst_R>)",
+                                  numDupli = "Genus")
+                                  
+print( "Number of samples before filtering (min lib size):")
+nsamples(La_Gla_clean_16S_prev_filt)
+
+print( "Number of samples after filtering:")
+nsamples(La_Gla_clean_16S_filt)
+
+#total number of sequences
+print( "Total number of sequences after filtering")
+sum(otu_table(La_Gla_clean_16S_filt))
+
+#calculate average library size
+avg_lib_size <- mean(sample_sums(La_Gla_clean_16S_filt))
+print(paste("Average library size after filtering:", avg_lib_size))
+
+saveRDS((La_Gla_clean_16S_filt), file = "La_Gla_final_16S.Rds")
+
+
+
+#tax_fix_interactive(La_Gla_clean_16S_filt)
+
+#ITS
+La_Gla_clean_ITS <- La_Gla_ITS %>%
+  ps_filter(Control == "FALSE", .keep_all_taxa = TRUE) %>%
+  ps_dedupe(vars = "Sample.Name")
+  
+  
+n_samples <- nsamples(La_Gla_clean_ITS)
+prevalence_threshold <- min_prevalence * n_samples  
+# Convert to sample count
+
+
+
+# Create a logical table of presence/absence (1 = present, 0 = absent)
+taxa_presence <- otu_table(La_Gla_clean_ITS) > 0
+
+# Count number of samples where each taxon is present
+taxa_prevalence <- rowSums(taxa_presence)
+
+
+# Identify taxa that meet the prevalence threshold
+keep_taxa <- taxa_names(La_Gla_clean_ITS)[taxa_prevalence >= prevalence_threshold]
+
+# Subset the phyloseq object
+La_Gla_clean_ITS_prev_filt <- prune_taxa(keep_taxa, La_Gla_clean_ITS)
+
+
+# Number of taxa before filtering
+ntaxa(La_Gla_clean_ITS)
+
+# Number of taxa after filtering
+ntaxa(La_Gla_clean_ITS_prev_filt)  
+  
+  
+  # Identify samples that meet the threshold
+keep_samples <- sample_sums(La_Gla_clean_ITS_prev_filt) >= min_threshold
+
+La_Gla_clean_ITS_filt <- prune_samples(keep_samples, La_Gla_clean_ITS_prev_filt)
+
+
+# Number of samples before filtering
+nsamples(La_Gla_clean_ITS_prev_filt)
+
+# Number of samples after filtering
+nsamples(La_Gla_clean_ITS_filt)
+
+#total number of sequences
+print( "Total number of sequences after filtering")
+sum(otu_table(La_Gla_clean_ITS_filt))
+
+#calculate average library size
+avg_lib_size <- mean(sample_sums(La_Gla_clean_ITS_filt))
+print(paste("Average library size after filtering:", avg_lib_size))
+
+La_Gla_ITS_genus <- tax_glom(La_Gla_clean_ITS_filt, taxrank = "Genus")
+
+#tax_fix_interactive(La_Gla_ITS_genus)
+
+La_Gla_ITS_genus_renamed <- renameTaxa(La_Gla_ITS_genus,
+                                  pat = "<name>",
+                                  substPat = "<name>_<subst_name>(<subst_R>)",
+                                  numDupli = "Genus")
+
+saveRDS((La_Gla_ITS_genus), file = "La_Gla_final_ITS.Rds")
+
+#tax_fix_interactive(La_Gla_ITS_genus)
+```
+
+
+## All samples
+
+```{r, all samples, echo=FALSE}
+sample_data(La_Gla_16S_genus_renamed)$Sample.Type <- factor(
+  sample_data(La_Gla_16S_genus_renamed)$Sample.Type,
+  levels = c("Lichen", "Soil Crust", "Moss", "Bulk Soil", "Plant")
+)
+
+sample_data(La_Gla_ITS_genus_renamed)$Sample.Type <- factor(
+  sample_data(La_Gla_ITS_genus_renamed)$Sample.Type,
+  levels = c("Lichen", "Soil Crust", "Moss", "Bulk Soil", "Plant")
+)
+
+bac_meta <- as.matrix(sample_data(La_Gla_16S_genus_renamed))
+bac_meta <- as.data.frame(bac_meta)
+
+La_Gla_16S_genus_renamed_pseudo <- La_Gla_16S_genus_renamed  
+  
+# 1. Extract OTU table, add pseudocount
+otu_with_pseudo <- otu_table(La_Gla_16S_genus_renamed) + 1e-6
+
+# 2. Replace the OTU table in the phyloseq object
+otu_table(La_Gla_16S_genus_renamed_pseudo) <- otu_with_pseudo
+
+La_Gla_16S_genus_renamed_pseudo %>%
+ tax_transform(rank = "Phylum", trans = "clr") %>%
+ dist_calc(dist = "euclidean") %>%
+ ord_calc(
+  method = "auto"
+ ) %>% 
+ ord_plot(
+  axes = c(1, 2),
+  colour = "Sample.Type", fill = "Sample.Type",
+  shape = "Moraine", alpha = 0.5,
+  size = 3,
+  plot_taxa = 1:10,
+  )+
+ scale_shape_girafe_filled()+
+  ggtitle(
+    "PCA of Bacterial Phyla from All Samples",
+  )
+
+
+
+
+  
+ #  La_Gla_16S_genus_renamed %>%
+ # tax_transform(rank = "Genus", trans = "clr") %>%
+ # # dist_calc(dist = "euclidean") %>%
+ # ord_calc(
+ #  method = "auto"
+ # ) %>% 
+ # ord_plot(
+ #  axes = c(1, 2),
+ #  colour = "Sample.Type", fill = "Sample.Type",
+ #  shape = "Moraine", alpha = 0.5,
+ #  size = 3,
+ #  plot_taxa = 1:10,
+ #  )+
+ # scale_shape_girafe_filled()+
+ #  ggtitle(
+ #    "PCA of Bacterial Genera from All Samples",
+ #  )
+  
+  La_Gla_16S_genus_renamed_pseudo %>%
+ tax_transform(rank = "Genus", trans = "clr") %>%
+    dist_calc(dist = "euclidean") %>%
+ ord_calc(
+  method = "auto"
+ ) %>% 
+ ord_plot(
+  axes = c(1, 2),
+  colour = "Sample.Type", fill = "Sample.Type",
+  shape = "Moraine", alpha = 0.5,
+  size = 2
+ ) + 
+ scale_shape_girafe_filled() +
+ ggplot2::stat_ellipse(
+  ggplot2::aes(colour = Sample.Type)) + 
+    ggtitle(
+    "PCA of Bacterial Genera from All Samples",
+ )
+  
+  
+P <- La_Gla_16S_genus_renamed_pseudo %>%
+  tax_transform(rank = "Genus", trans = "clr") %>%
+  dist_calc(dist = "euclidean") %>%
+  ord_calc(method = "auto") %>%
+  ord_plot(
+    axes = c(1, 2),
+    colour = "Sample.Type",    # outline color (will be overwritten by scale_colour_manual)
+    fill = "Sample.Type",      # fill color
+    shape = "Moraine",
+    alpha = 0.8,               # fill opacity
+    size = 2
+    
+  ) +
+  scale_shape_girafe_filled() +
+  ggplot2::stat_ellipse(ggplot2::aes(colour = Sample.Type)) +
+  scale_colour_manual(   # outline color
+    values = c(
+      "Lichen" = "#FF7F0E",
+      "Bulk Soil" = "#59310E",
+      "Plant" = "#1DA20E",
+      "Moss" = "#A3A500",
+      "Soil Crust" = "#155A8A"
+    )
+  ) +
+  scale_fill_manual(     # fill color
+    values = c(
+      "Lichen" = "#FF7F0E",
+      "Bulk Soil" = "#59310E",
+      "Plant" = "#1DA20E",
+      "Moss" = "#A3A500",
+      "Soil Crust" = "#155A8A"
+    )
+  ) +
+  ggtitle("PCoA of Bacterial Genera from All Samples_Final_pseudo") +
+  theme_minimal()
+ 
+ P
+ 
+ # Save as SVG
+ggsave("La_Gla_16S_genus_renamed_16S_PCoA.svg", P,device = "svg", width = 8, height = 8)
+  
+
+# # Extract ordination object
+# ord <- La_Gla_16S_genus_renamed_pseudo %>%
+#   tax_transform(rank = "Genus", trans = "clr") %>%
+#   dist_calc(dist = "euclidean") %>%
+#   ord_calc(method = "auto")
+# 
+# # Create the plot manually
+# P <- ord_plot(ord, axes = c(1, 2)) +
+#   geom_point(
+#     aes(
+#       x = Axis.1, y = Axis.2,
+#       fill = Sample.Type,
+#       shape = Moraine
+#     ),
+#     data = sample_data(ord),
+#     color = "black",       # outline color
+#     stroke = 0.8,          # outline thickness
+#     alpha = 0.8,           # fill opacity
+#     size = 3
+#   ) +
+#   stat_ellipse(aes(x = Axis.1, y = Axis.2, colour = Sample.Type),
+#                data = sample_data(ord)) +
+#   scale_shape_girafe_filled() +
+#   scale_fill_manual(values = c(
+#     "Lichen" = "#FF7F0E",
+#     "Bulk Soil" = "#59310E",
+#     "Plant" = "#1DA20E",
+#     "Moss" = "#A3A500",
+#     "Soil Crust" = "#155A8A"
+#   )) +
+#   scale_colour_manual(values = c(
+#     "Lichen" = "#FF7F0E",
+#     "Bulk Soil" = "#59310E",
+#     "Plant" = "#1DA20E",
+#     "Moss" = "#A3A500",
+#     "Soil Crust" = "#155A8A"
+#   )) +
+#   ggtitle("PCA of Bacterial Genera from All Samples_Final_pseudo_testingOutlines") +
+#   theme_minimal()
+# 
+# # Save as SVG
+# ggsave("La_Gla_16S_genus_renamed_PCoA_testingOutlines.svg", P,device = "svg", width = 8, height = 8)
+
+
+
+
+    
+ # La_Gla_16S_genus_renamed %>% perm_get()
+
+# library(car)
+# vif(lm(DistanceFromGlacier ~ Sample.Type + GlacierID + Location + Moraine_num + Library_Size, data = Meta_16S))
+
+
+# 3. Now proceed with your CLR + PERMANOVA
+La_Gla_16S_genus_renamed_perm <- La_Gla_16S_genus_renamed %>%
+  tax_transform("clr", rank = "Genus") %>%
+  dist_calc("euclidean") %>%
+  dist_permanova(
+    variables = c("Sample.Type", "Library_Size"),
+    n_perms = 999,
+    #strata = bac_meta$Plot,
+    n_processes = 1
+  )  
+
+print(La_Gla_16S_genus_renamed_perm)
+  
+  
+print("      permanova with rarefaction at genus level, with aitchinson distance")
+La_Gla_16S_genus_renamed_perm <- La_Gla_16S_genus_renamed_pseudo %>%
+  tax_transform("clr", rank = "Genus") %>%
+  dist_calc("euclidean") %>%
+  dist_permanova(
+    variables = c("Sample.Type", "Moraine", "Location"),
+    n_perms = 999, # you should use more permutations in your real analyses!
+    n_processes = 1
+  )
+
+La_Gla_16S_genus_renamed_perm
+
+
+
+# ANOVA (if assumptions are met)
+#aov_model <- aov(Shannon ~ Sample.Type * Moraine, data = your_data)
+
+# OR Kruskal-Wallis (non-parametric)
+#kruskal_model <- kruskal.test(Shannon ~ interaction(Sample.Type, Moraine), data = your_data)
+
+
+#plot shannon for 16S
+p <- plot_richness(La_Gla_16S_genus_renamed, x = "Sample.Type", color = "Sample.Type", measures = c("Shannon"))
+
+# Remove default points layer
+p$layers <- p$layers[-1]
+
+# Add boxplot, faded points, and facet by Moraine
+p <- p + 
+  geom_boxplot(size = 1) + 
+  geom_jitter(position = position_jitter(width = 0.2), size = 2, alpha = 0.5) + 
+  facet_wrap(~Moraine) + 
+  theme_modern()+
+  xlab(NULL)+
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank()
+  )+  ylab("Shannon Diversity Index - 16S")
+
+# Save as SVG
+ggsave("La_Gla_16S_genus_renamed_16S_Shannon.svg", p,device = "svg", width = 8, height = 3)
+
+#ADD TO METADATA TABLE
+
+# 1. Calculate richness (e.g., Shannon)
+shannon_df <- estimate_richness(La_Gla_16S_genus_renamed, measures = "Shannon")
+
+# 2. Check that rownames match sample names
+head(rownames(shannon_df))
+head(sample_names(La_Gla_16S_genus_renamed))
+
+# 3. Convert sample_data to data frame if needed
+sample_df <- as.matrix(sample_data(La_Gla_16S_genus_renamed))
+sample_df <- as.data.frame(sample_df)
+
+# 4. Combine richness values with sample_data
+sample_df$Bac_Shannon <- shannon_df$Shannon
+
+# 5. Update sample_data in the phyloseq object
+sample_data(La_Gla_16S_genus_renamed) <- sample_data(sample_df)
+
+
+
+
+
+
+#plot chao richness for 16s
+p <- plot_richness(La_Gla_16S_genus_renamed, x = "Sample.Type", color = "Sample.Type", measures = c("Chao1"))
+
+# Remove default points layer
+p$layers <- p$layers[-1]
+
+# Add boxplot, faded points, and facet by Moraine
+p <- p + 
+  geom_boxplot(size = 1) + 
+  geom_jitter(position = position_jitter(width = 0.2), size = 2, alpha = 0.5) + 
+  facet_wrap(~Moraine) + 
+  theme_modern()+
+  xlab(NULL)+
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank()
+  )+ ylab("Chao Richness - 16S")
+
+# Save as SVG
+ggsave("La_Gla_16S_genus_renamed_16S_Chao.svg", p,device = "svg", width = 8, height = 3)
+
+#ADD TO METADATA TABLE
+# 1. Calculate richness (e.g., Chao1)
+chao_df <- estimate_richness(La_Gla_16S_genus_renamed, measures = "Chao1")
+
+# 2. Check that rownames match sample names
+head(rownames(chao_df))
+head(sample_names(La_Gla_16S_genus_renamed))
+
+# 3. Convert sample_data to data frame if needed
+sample_df <- as.matrix(sample_data(La_Gla_16S_genus_renamed))
+sample_df <- as.data.frame(sample_df)
+
+# 4. Combine richness values with sample_data
+sample_df$Bac_Chao <- chao_df$Chao1
+
+# 5. Update sample_data in the phyloseq object
+sample_data(La_Gla_16S_genus_renamed) <- sample_data(sample_df)
+
+# Load required libraries
+library(phyloseq)
+library(microbiome)   # for CLR transformation
+library(ggplot2)
+library(dplyr)
+
+# Normalize to relative abundances (proportions), then add pseudocount
+otu_rel <- transform_sample_counts(La_Gla_16S_genus_renamed, function(x) x / sum(x))
+
+# Add pseudocount and CLR-transform
+otu_clr <- otu_rel %>%
+  transform_sample_counts(function(x) x + 0.0001) %>%  # Small pseudocount for compositional data
+  microbiome::transform("clr")
+
+
+# Step 2: Extract the CLR-transformed OTU table
+otu_mat <- as.data.frame(otu_table(otu_clr))
+if (taxa_are_rows(otu_clr)) {
+  otu_mat <- t(otu_mat)
+}
+
+# Step 3: Perform PCA
+pca_res <- prcomp(otu_mat, scale = TRUE)
+pca_df <- as.data.frame(pca_res$x)
+pca_df$SampleID <- rownames(pca_df)
+
+# Step 4: Extract and attach sample metadata
+meta_df <- as.matrix(sample_data(otu_clr))
+meta_df <- as.data.frame(meta_df)
+meta_df$SampleID <- rownames(meta_df)
+pca_df <- left_join(pca_df, meta_df, by = "SampleID")
+
+# Step 5: Plot PCA with 95% confidence ellipses by Sample.Type
+ggplot(pca_df, aes(x = PC1, y = PC2, color = Sample.Type, shape = Moraine)) +
+  #stat_ellipse(aes(group = Sample.Type), level = 0.95, linetype = "dashed") +
+  geom_point(size = 3) +
+  theme_minimal() +
+  labs(
+    title = "PCA of CLR-transformed OTU Table",
+    x = paste0("PC1 (", round(summary(pca_res)$importance[2, 1] * 100, 1), "%)"),
+    y = paste0("PC2 (", round(summary(pca_res)$importance[2, 2] * 100, 1), "%)")
+  )
+
+
+#Extract OTU table
+Bac_otu_pseudo <- as.matrix(otu_table(La_Gla_16S_genus_renamed_pseudo)) 
+Bac_otu_pseudo <- as.data.frame(Bac_otu_pseudo)
+
+#CLR transformation
+Bac_otu_clr <- Bac_otu_pseudo %>%
+  microbiome::transform("clr")
+Bac_otu_clr <- as.data.frame(Bac_otu_clr)
+
+class(Bac_otu_clr)
+
+Bac_meta <- as.matrix(bac_meta)
+Bac_meta <- as.data.frame(Bac_meta)
+
+class(Bac_meta)
+
+#convert to numeric and factor
+Bac_meta$Moraine <- as.factor(Bac_meta$Moraine)
+Bac_meta$Sample.Type <- as.factor(Bac_meta$Sample.Type)
+Bac_meta$Location <- as.factor(Bac_meta$Location)
+Bac_meta$Plot <- as.factor(Bac_meta$Plot)
+
+result <- adonis2(Bac_otu_clr ~  Moraine + Sample.Type + Location, data = Bac_meta, method="euclidean", strata = Bac_meta$Plot ,perm=999)
+print(result)
+
+
+
+
+#run betadisperse
+# Get Sample.Type grouping variable
+group <- sample_data(La_Gla_16S_genus_renamed_pseudo)$Sample.Type
+
+# Calculate Bray-Curtis dissimilarity
+euc_dist <- vegdist(Bac_otu_clr, method = "euclidean")
+
+
+# Run beta dispersion
+disper <- betadisper(euc_dist, group)
+
+# Test for significant differences in dispersion
+anova(disper)
+
+plot(disper)
+boxplot(disper, xlab = "Sample Type", ylab = "Distance to Centroid")
+
+
+
+permutest(disper, permutations = 999)
+
+
+#mixed effect models
+
+Bac_meta <- as.matrix(sample_data(La_Gla_16S_genus_renamed))
+Bac_meta <- as.data.frame(Bac_meta)
+
+Bac_meta$Bac_Shannon <- as.numeric(Bac_meta$Bac_Shannon)
+Bac_meta$Moraine_num <- as.numeric(Bac_meta$Moraine_num)
+Bac_meta$Sample.Type <- as.factor(Bac_meta$Sample.Type)
+Bac_meta$Location <- as.factor(Bac_meta$Location)
+Bac_meta$Plot <- as.factor(Bac_meta$Plot)
+Bac_meta$Bac_Chao <- as.numeric(Bac_meta$Bac_Chao)
+
+
+mixed_effect_model <- lmer(Bac_Shannon ~ Moraine * Sample.Type * Location  + (1|Plot), data = Bac_meta)
+
+# Perform ANOVA using the car package
+anova_result <- Anova(mixed_effect_model, test="F")
+
+# Display the ANOVA table
+print(anova_result)
+
+#subset first moraine
+Bac_meta_first_moraine <- Bac_meta[Bac_meta$Moraine_num == 1, ]
+
+# Fit the ART model (fixed effect: Treatment, random effect: Plot)
+art_model <- art(Bac_Shannon ~  Sample.Type , data = Bac_meta_first_moraine)
+
+
+anova_art <- anova(art_model)
+print(anova_art)
+
+
+# Extract the aligned model (for Treatment)
+art_emm <- emmeans(artlm(art_model, "Sample.Type"), pairwise ~ Sample.Type, adjust = "fdr")
+
+# See pairwise comparisons
+summary(art_emm$contrasts)
+
+pw_df <- summary(art_emm$contrasts)
+
+letters_df <- cldList(p.value ~ contrast, data = pw_df, threshold = 0.05)
+
+#now for second moraine
+Bac_meta_second_moraine <- Bac_meta[Bac_meta$Moraine_num == 2, ]
+
+# Fit the ART model (fixed effect: Treatment, random effect: Plot)
+art_model_second <- art(Bac_Shannon ~  Sample.Type , data = Bac_meta_second_moraine)
+
+anova_art_second <- anova(art_model_second)
+print(anova_art_second)
+
+# Extract the aligned model (for Treatment)
+art_emm_second <- emmeans(artlm(art_model_second, "Sample.Type"), pairwise ~ Sample.Type, adjust = "fdr")
+
+# See pairwise comparisons
+summary(art_emm_second$contrasts)
+pw_df_second <- summary(art_emm_second$contrasts)
+letters_df_second <- cldList(p.value ~ contrast, data = pw_df_second, threshold = 0.05)
+
+#third moraine now
+Bac_meta_third_moraine <- Bac_meta[Bac_meta$Moraine_num == 3, ]
+
+# Fit the ART model (fixed effect: Treatment, random effect: Plot)
+art_model_third <- art(Bac_Shannon ~  Sample.Type , data = Bac_meta_third_moraine)
+anova_art_third <- anova(art_model_third)
+
+print(anova_art_third)
+
+# Extract the aligned model (for Treatment)
+art_emm_third <- emmeans(artlm(art_model_third, "Sample.Type"), pairwise ~ Sample.Type, adjust = "fdr")
+# See pairwise comparisons
+summary(art_emm_third$contrasts)
+pw_df_third <- summary(art_emm_third$contrasts)
+letters_df_third <- cldList(p.value ~ contrast, data = pw_df_third, threshold = 0.05)
+
+
+#now for richness
+mixed_effect_model <- lmer(Bac_Chao ~ Moraine * Sample.Type * Location  + (1|Plot), data = Bac_meta)
+
+# Perform ANOVA using the car package
+anova_result <- Anova(mixed_effect_model, test="F")
+
+# Display the ANOVA table
+print(anova_result)
+
+
+#first moraine w chao
+Bac_meta_first_moraine <- Bac_meta[Bac_meta$Moraine_num == 1, ]
+# Fit the ART model (fixed effect: Treatment, random effect: Plot)
+art_model_chao <- art(Bac_Chao ~  Sample.Type , data = Bac_meta_first_moraine)
+anova_art_chao <- anova(art_model_chao)
+print(anova_art_chao)
+
+# Extract the aligned model (for Treatment)
+art_emm_chao <- emmeans(artlm(art_model_chao, "Sample.Type"), pairwise ~ Sample.Type, adjust = "fdr")
+# See pairwise comparisons
+summary(art_emm_chao$contrasts)
+pw_df_chao <- summary(art_emm_chao$contrasts)
+letters_df_chao <- cldList(p.value ~ contrast, data = pw_df_chao, threshold = 0.05)
+
+
+#second moraine w chao
+Bac_meta_second_moraine <- Bac_meta[Bac_meta$Moraine_num == 2, ]
+# Fit the ART model (fixed effect: Treatment, random effect: Plot)
+art_model_chao_second <- art(Bac_Chao ~  Sample.Type , data = Bac_meta_second_moraine)
+anova_art_chao_second <- anova(art_model_chao_second)
+print(anova_art_chao_second)
+
+# Extract the aligned model (for Treatment)
+art_emm_chao_second <- emmeans(artlm(art_model_chao_second, "Sample.Type"), pairwise ~ Sample.Type, adjust = "fdr")
+# See pairwise comparisons
+summary(art_emm_chao_second$contrasts)
+pw_df_chao_second <- summary(art_emm_chao_second$contrasts)
+letters_df_chao_second <- cldList(p.value ~ contrast, data = pw_df_chao_second, threshold = 0.05)
+
+
+#third moraine
+Bac_meta_third_moraine <- Bac_meta[Bac_meta$Moraine_num == 3, ]
+# Fit the ART model (fixed effect: Treatment, random effect: Plot)
+art_model_chao_third <- art(Bac_Chao ~  Sample.Type , data = Bac_meta_third_moraine)
+anova_art_chao_third <- anova(art_model_chao_third)
+print(anova_art_chao_third)
+
+# Extract the aligned model (for Treatment)
+art_emm_chao_third <- emmeans(artlm(art_model_chao_third, "Sample.Type"), pairwise ~ Sample.Type, adjust = "fdr")
+# See pairwise comparisons
+summary(art_emm_chao_third$contrasts)
+pw_df_chao_third <- summary(art_emm_chao_third$contrasts)
+letters_df_chao_third <- cldList(p.value ~ contrast, data = pw_df_chao_third, threshold = 0.05)
+
+
+
+#beta dispersion for I6S, separated by moraine
+
+#extract betadispersion values
+# Get Sample.Type grouping variable
+samp_group <- sample_data(La_Gla_16S_genus_renamed_pseudo)$Sample.Type
+
+moraine_group <- sample_data(La_Gla_16S_genus_renamed_pseudo)$Moraine
+
+#create interaction term
+group <- interaction(samp_group, moraine_group)
+
+# Calculate Bray-Curtis dissimilarity
+euc_dist <- vegdist(Bac_otu_clr, method = "euclidean")
+
+
+# Run beta dispersion
+disper <- betadisper(euc_dist, group)
+
+#extract values from disper
+Bac_meta$betaDist <- disper$distances
+
+#now for richness
+mixed_effect_model <- lmer(betaDist ~ Moraine * Sample.Type * Location  + (1|Plot), data = Bac_meta)
+
+# Perform ANOVA using the car package
+anova_result <- Anova(mixed_effect_model, test="F")
+
+# Display the ANOVA table
+print(anova_result)
+
+
+# Create the boxplot
+p_beta <- ggplot(Bac_meta, aes(x = Sample.Type, y = betaDist, color = Sample.Type)) +
+  geom_boxplot(size = 1) +
+  geom_jitter(position = position_jitter(width = 0.2), size = 2, alpha = 0.5) +
+  facet_wrap(~Moraine) +
+  theme_modern() +
+  xlab(NULL) +
+  ylab("Distance to centroid - 16S") +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    legend.position = "right"
+  )
+
+# Print the plot
+p_beta
+
+# Save as SVG
+ggsave("La_Gla_16S_genus_renamed_16S_BetaDisp.svg", p_beta,device = "svg", width = 8, height = 3)
+
+#first moraine w betaDist
+Bac_meta_first_moraine <- Bac_meta[Bac_meta$Moraine_num == 1, ]
+# Fit the ART model (fixed effect: Treatment, random effect: Plot)
+
+
+# Fit the ART model (fixed effect: Treatment, random effect: Plot)
+art_model <- art(betaDist ~  Sample.Type , data = Bac_meta_first_moraine)
+
+
+anova_art <- anova(art_model)
+print(anova_art)
+
+
+# Extract the aligned model (for Treatment)
+art_emm <- emmeans(artlm(art_model, "Sample.Type"), pairwise ~ Sample.Type, adjust = "fdr")
+
+# See pairwise comparisons
+summary(art_emm$contrasts)
+
+pw_df <- summary(art_emm$contrasts)
+
+letters_df <- cldList(p.value ~ contrast, data = pw_df, threshold = 0.05)
+
+#second moraine w betaDist
+Bac_meta_second_moraine <- Bac_meta[Bac_meta$Moraine_num == 2, ]
+# Fit the ART model (fixed effect: Treatment, random effect: Plot)
+
+
+# Fit the ART model (fixed effect: Treatment, random effect: Plot)
+art_model <- art(betaDist ~  Sample.Type , data = Bac_meta_second_moraine)
+
+
+anova_art <- anova(art_model)
+print(anova_art)
+
+
+# Extract the aligned model (for Treatment)
+art_emm <- emmeans(artlm(art_model, "Sample.Type"), pairwise ~ Sample.Type, adjust = "fdr")
+
+# See pairwise comparisons
+summary(art_emm$contrasts)
+
+pw_df <- summary(art_emm$contrasts)
+
+letters_df <- cldList(p.value ~ contrast, data = pw_df, threshold = 0.05)
+
+
+#third moraine w betaDist
+Bac_meta_third_moraine <- Bac_meta[Bac_meta$Moraine_num == 3, ]
+# Fit the ART model (fixed effect: Treatment, random effect: Plot)
+
+
+# Fit the ART model (fixed effect: Treatment, random effect: Plot)
+art_model <- art(betaDist ~  Sample.Type , data = Bac_meta_third_moraine)
+
+
+anova_art <- anova(art_model)
+print(anova_art)
+
+
+# Extract the aligned model (for Treatment)
+art_emm <- emmeans(artlm(art_model, "Sample.Type"), pairwise ~ Sample.Type, adjust = "fdr")
+
+# See pairwise comparisons
+summary(art_emm$contrasts)
+
+pw_df <- summary(art_emm$contrasts)
+
+letters_df <- cldList(p.value ~ contrast, data = pw_df, threshold = 0.05)
+
+
+
+
+```
+
+
+
+
+
+
+```{r, all samples ITS, echo=FALSE}
+
+La_Gla_ITS_genus_renamed_pseudo <- La_Gla_ITS_genus_renamed
+
+# 1. Extract OTU table, add pseudocount
+otu_with_pseudo <- otu_table(La_Gla_ITS_genus_renamed) + 1e-6
+
+# 2. Replace the OTU table in the phyloseq object
+otu_table(La_Gla_ITS_genus_renamed_pseudo) <- otu_with_pseudo
+
+fun_meta <- sample_data(La_Gla_ITS_genus_renamed_pseudo)
+
+
+La_Gla_ITS_genus_renamed_pseudo %>%
+ tax_transform(rank = "Phylum", trans = "clr") %>%
+ dist_calc(dist = "euclidean") %>%
+ ord_calc(
+  method = "PCoA"
+ ) %>% 
+ ord_plot(
+  axes = c(1, 2),
+  colour = "Sample.Type", fill = "Sample.Type",
+  shape = "Moraine", alpha = 0.5,
+  size = 3,
+  plot_taxa = 1:10,
+  )+
+ scale_shape_girafe_filled()+
+  ggtitle(
+    "PCA of Fungal Phyla from All Samples",
+  )
+  
+  
+La_Gla_ITS_genus_renamed %>%
+ tax_transform(rank = "Genus", trans = "clr") %>%
+ dist_calc(dist = "euclidean") %>%
+ ord_calc(
+  method = "auto"
+ ) %>% 
+ ord_plot(
+  axes = c(1, 2),
+  colour = "Sample.Type", fill = "Sample.Type",
+  shape = "Moraine", alpha = 0.5,
+  size = 3,
+  plot_taxa = 1:10,
+  )+
+ scale_shape_girafe_filled()+
+  ggtitle(
+    "PCA of Fungal Genera from All Samples",
+  )  
+
+P <- La_Gla_ITS_genus_renamed_pseudo %>%
+  tax_transform(rank = "Genus", trans = "clr") %>%
+  dist_calc(dist = "euclidean") %>%
+  ord_calc(method = "auto") %>%
+  ord_plot(
+    axes = c(1, 2),
+    colour = "Sample.Type",    # outline color (will be overwritten by scale_colour_manual)
+    fill = "Sample.Type",      # fill color
+    shape = "Moraine",
+    alpha = 0.8,               # fill opacity
+    size = 2
+  ) +
+  scale_shape_girafe_filled() +
+  ggplot2::stat_ellipse(ggplot2::aes(colour = Sample.Type)) +
+  scale_colour_manual(   # outline color
+    values = c(
+      "Lichen" = "#FF7F0E",
+      "Bulk Soil" = "#59310E",
+      "Plant" = "#1DA20E",
+      "Moss" = "#A3A500",
+      "Soil Crust" = "#155A8A"
+    )
+  ) +
+  scale_fill_manual(     # fill color
+    values = c(
+      "Lichen" = "#FF7F0E",
+      "Bulk Soil" = "#59310E",
+      "Plant" = "#1DA20E",
+      "Moss" = "#A3A500",
+      "Soil Crust" = "#155A8A"
+    )
+  ) +
+  ggtitle("PCoA of Fungal Genera from All Samples_Final_pseudo") +
+  theme_minimal()
+ 
+ P
+ 
+ # Save as SVG
+ggsave("La_Gla_16S_genus_renamed_ITSS_PCoA.svg", P,device = "svg", width = 8, height = 8)
+
+
+
+
+
+
+# Extract ordination object
+ord <- La_Gla_ITS_genus_renamed_pseudo %>%
+  tax_transform(rank = "Genus", trans = "clr") %>%
+  dist_calc(dist = "euclidean") %>%
+  ord_calc(method = "auto")
+
+# Create the plot manually
+P <- ord_plot(ord, axes = c(1, 2)) +
+  geom_point(
+    aes(
+      x = Axis.1, y = Axis.2,
+      fill = Sample.Type,
+      shape = Moraine
+    ),
+    data = sample_data(ord),
+    color = "black",       # outline color
+    stroke = 0.8,          # outline thickness
+    alpha = 0.8,           # fill opacity
+    size = 3
+  ) +
+  stat_ellipse(aes(x = Axis.1, y = Axis.2, colour = Sample.Type),
+               data = sample_data(ord)) +
+  scale_shape_girafe_filled() +
+  scale_fill_manual(values = c(
+    "Lichen" = "#FF7F0E",
+    "Bulk Soil" = "#59310E",
+    "Plant" = "#1DA20E",
+    "Moss" = "#A3A500",
+    "Soil Crust" = "#155A8A"
+  )) +
+  scale_colour_manual(values = c(
+    "Lichen" = "#FF7F0E",
+    "Bulk Soil" = "#59310E",
+    "Plant" = "#1DA20E",
+    "Moss" = "#A3A500",
+    "Soil Crust" = "#155A8A"
+  )) +
+  ggtitle("PCA of Fungal Genera from All Samples_Final_pseudo_testingOutlines") +
+  theme_minimal()
+
+# Save as SVG
+#ggsave("La_Gla_ITS_genus_renamed_ITSS_PCoA_testingOutlines.svg", P,device = "svg", width = 8, height = 8)
+
+
+
+
+#plot shannon for ITS
+p <- plot_richness(La_Gla_ITS_genus_renamed, x = "Sample.Type", color = "Sample.Type", measures = c("Shannon"))
+
+# Remove default points layer
+p$layers <- p$layers[-1]
+
+# Add boxplot, faded points, and facet by Moraine
+p <- p + 
+  geom_boxplot(size = 1) + 
+  geom_jitter(position = position_jitter(width = 0.2), size = 2, alpha = 0.5) + 
+  facet_wrap(~Moraine) + 
+  theme_modern()+
+  xlab(NULL)+
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank()
+  )+  ylab("Shannon Diversity Index - ITS")
+
+p
+# Save as SVG
+ggsave("La_Gla_ITS_genus_renamed_ITS_Shannon.svg", p,device = "svg", width = 8, height = 3)
+
+
+#ADD TO METADATA TABLE
+
+# 1. Calculate richness (e.g., Shannon)
+shannon_df <- estimate_richness(La_Gla_ITS_genus_renamed, measures = "Shannon")
+
+# 2. Check that rownames match sample names
+head(rownames(shannon_df))
+head(sample_names(La_Gla_ITS_genus_renamed))
+
+# 3. Convert sample_data to data frame if needed
+sample_df <- as.matrix(sample_data(La_Gla_ITS_genus_renamed))
+sample_df <- as.data.frame(sample_df)
+
+# 4. Combine richness values with sample_data
+sample_df$Fungi_Shannon <- shannon_df$Shannon
+
+# 5. Update sample_data in the phyloseq object
+sample_data(La_Gla_ITS_genus_renamed) <- sample_data(sample_df)
+
+
+
+
+
+#plot chao richness for ITS
+p <- plot_richness(La_Gla_ITS_genus_renamed, x = "Sample.Type", color = "Sample.Type", measures = c("Chao1"))
+
+# Remove default points layer
+p$layers <- p$layers[-1]
+
+# Add boxplot, faded points, and facet by Moraine
+p <- p + 
+  geom_boxplot(size = 1) + 
+  geom_jitter(position = position_jitter(width = 0.2), size = 2, alpha = 0.5) + 
+  facet_wrap(~Moraine) + 
+  theme_modern()+
+  xlab(NULL)+
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank()
+  )+ ylab("Chao Richness - ITS")
+
+p
+# Save as SVG
+ggsave("La_Gla_ITS_genus_renamed_ITS_Chao.svg", p,device = "svg", width = 8, height = 3)
+
+#ADD TO METADATA TABLE
+
+# 1. Calculate richness (e.g., Shannon)
+Chao_df <- estimate_richness(La_Gla_ITS_genus_renamed, measures = "Chao1")
+
+# 2. Check that rownames match sample names
+head(rownames(Chao_df))
+head(sample_names(La_Gla_ITS_genus_renamed))
+
+# 3. Convert sample_data to data frame if needed
+sample_df <- as.matrix(sample_data(La_Gla_ITS_genus_renamed))
+sample_df <- as.data.frame(sample_df)
+
+# 4. Combine richness values with sample_data
+sample_df$Fungi_Chao <- Chao_df$Chao1
+
+# 5. Update sample_data in the phyloseq object
+sample_data(La_Gla_ITS_genus_renamed) <- sample_data(sample_df)
+
+
+
+
+p <-plot_richness(La_Gla_ITS_genus_renamed, x="Moraine", color = "Sample.Type", measures=c( "Shannon"))
+p$layers <- p$layers[-1]
+p$layers
+p +  geom_boxplot()
+
+p <-plot_richness(La_Gla_ITS_genus_renamed, x="Moraine", color = "Sample.Type", measures=c("Chao1"))
+p$layers <- p$layers[-1]
+p$layers <- p$layers[-1]
+p$layers
+p +  geom_boxplot()
+# 
+# La_Gla_ITS_genus_renamed %>%
+#  tax_transform(rank = "Genus", trans = "binary") %>%
+#  dist_calc(dist = "bray") %>%
+#  ord_calc(
+#   method = "auto"
+#  ) %>% 
+#  ord_plot(
+#   axes = c(1, 2),
+#   colour = "Sample.Type", fill = "Sample.Type",
+#   shape = "Moraine", alpha = 0.5,
+#   size = 2
+#  ) + 
+#  scale_shape_girafe_filled() +
+#  ggplot2::stat_ellipse(
+#   ggplot2::aes(colour = Sample.Type)
+#  )+
+#   ggtitle(
+#     "PCA of Fungal Genera from All Samples",
+#   )  
+
+    
+#  La_Gla_ITS_genus_renamed %>% perm_get()
+
+
+#mixed effect models
+
+fungi_meta <- as.matrix(sample_data(La_Gla_ITS_genus_renamed))
+fungi_meta <- as.data.frame(fungi_meta)
+
+fungi_meta$Fungi_Shannon <- as.numeric(fungi_meta$Fungi_Shannon)
+fungi_meta$Moraine_num <- as.numeric(fungi_meta$Moraine_num)
+fungi_meta$Sample.Type <- as.factor(fungi_meta$Sample.Type)
+fungi_meta$Location <- as.factor(fungi_meta$Location)
+fungi_meta$Plot <- as.factor(fungi_meta$Plot)
+fungi_meta$Fungi_Chao <- as.numeric(fungi_meta$Fungi_Chao)
+fungi_meta$Moraine <- as.factor(fungi_meta$Moraine)
+
+
+mixed_effect_model <- lmer(Fungi_Shannon ~ Moraine * Sample.Type * Location  + (1|Plot), data = fungi_meta)
+
+# Perform ANOVA using the car package
+anova_result <- Anova(mixed_effect_model, test="F")
+
+# Display the ANOVA table
+print(anova_result)
+
+#subset first moraine
+fungi_meta_first_moraine <- fungi_meta[fungi_meta$Moraine_num == 1, ]
+
+# Fit the ART model (fixed effect: Treatment, random effect: Plot)
+art_model <- art(Fungi_Shannon ~  Sample.Type , data = fungi_meta_first_moraine)
+
+
+anova_art <- anova(art_model)
+print(anova_art)
+
+
+# Extract the aligned model (for Treatment)
+art_emm <- emmeans(artlm(art_model, "Sample.Type"), pairwise ~ Sample.Type, adjust = "fdr")
+
+# See pairwise comparisons
+summary(art_emm$contrasts)
+
+pw_df <- summary(art_emm$contrasts)
+
+letters_df <- cldList(p.value ~ contrast, data = pw_df, threshold = 0.05)
+
+#now for second moraine
+fungi_meta_second_moraine <- fungi_meta[fungi_meta$Moraine_num == 2, ]
+
+# Fit the ART model (fixed effect: Treatment, random effect: Plot)
+art_model_second <- art(Fungi_Shannon ~  Sample.Type , data = fungi_meta_second_moraine)
+
+anova_art_second <- anova(art_model_second)
+print(anova_art_second)
+
+# Extract the aligned model (for Treatment)
+art_emm_second <- emmeans(artlm(art_model_second, "Sample.Type"), pairwise ~ Sample.Type, adjust = "fdr")
+
+# See pairwise comparisons
+summary(art_emm_second$contrasts)
+pw_df_second <- summary(art_emm_second$contrasts)
+letters_df_second <- cldList(p.value ~ contrast, data = pw_df_second, threshold = 0.05)
+
+#third moraine now
+fungi_meta_third_moraine <- fungi_meta[fungi_meta$Moraine_num == 3, ]
+
+# Fit the ART model (fixed effect: Treatment, random effect: Plot)
+art_model_third <- art(Fungi_Shannon ~  Sample.Type , data = fungi_meta_third_moraine)
+anova_art_third <- anova(art_model_third)
+
+print(anova_art_third)
+
+# Extract the aligned model (for Treatment)
+art_emm_third <- emmeans(artlm(art_model_third, "Sample.Type"), pairwise ~ Sample.Type, adjust = "fdr")
+# See pairwise comparisons
+summary(art_emm_third$contrasts)
+pw_df_third <- summary(art_emm_third$contrasts)
+letters_df_third <- cldList(p.value ~ contrast, data = pw_df_third, threshold = 0.05)
+
+
+#now for richness
+mixed_effect_model <- lmer(Fungi_Chao ~ Moraine * Sample.Type * Location  + (1|Plot), data = fungi_meta)
+
+# Perform ANOVA using the car package
+anova_result <- Anova(mixed_effect_model, test="F")
+
+# Display the ANOVA table
+print(anova_result)
+
+
+#first moraine w chao
+fungi_meta_first_moraine <- fungi_meta[fungi_meta$Moraine_num == 1, ]
+# Fit the ART model (fixed effect: Treatment, random effect: Plot)
+art_model_chao <- art(Fungi_Chao ~  Sample.Type , data = fungi_meta_first_moraine)
+anova_art_chao <- anova(art_model_chao)
+print(anova_art_chao)
+
+# Extract the aligned model (for Treatment)
+art_emm_chao <- emmeans(artlm(art_model_chao, "Sample.Type"), pairwise ~ Sample.Type, adjust = "fdr")
+# See pairwise comparisons
+summary(art_emm_chao$contrasts)
+pw_df_chao <- summary(art_emm_chao$contrasts)
+letters_df_chao <- cldList(p.value ~ contrast, data = pw_df_chao, threshold = 0.05)
+
+
+#second moraine w chao
+fungi_meta_second_moraine <- fungi_meta[fungi_meta$Moraine_num == 2, ]
+# Fit the ART model (fixed effect: Treatment, random effect: Plot)
+art_model_chao_second <- art(Fungi_Chao ~  Sample.Type , data = fungi_meta_second_moraine)
+anova_art_chao_second <- anova(art_model_chao_second)
+print(anova_art_chao_second)
+
+# Extract the aligned model (for Treatment)
+art_emm_chao_second <- emmeans(artlm(art_model_chao_second, "Sample.Type"), pairwise ~ Sample.Type, adjust = "fdr")
+# See pairwise comparisons
+summary(art_emm_chao_second$contrasts)
+pw_df_chao_second <- summary(art_emm_chao_second$contrasts)
+letters_df_chao_second <- cldList(p.value ~ contrast, data = pw_df_chao_second, threshold = 0.05)
+
+
+#third moraine
+fungi_meta_third_moraine <- fungi_meta[fungi_meta$Moraine_num == 3, ]
+# Fit the ART model (fixed effect: Treatment, random effect: Plot)
+art_model_chao_third <- art(Fungi_Chao ~  Sample.Type , data = fungi_meta_third_moraine)
+anova_art_chao_third <- anova(art_model_chao_third)
+print(anova_art_chao_third)
+
+# Extract the aligned model (for Treatment)
+art_emm_chao_third <- emmeans(artlm(art_model_chao_third, "Sample.Type"), pairwise ~ Sample.Type, adjust = "fdr")
+# See pairwise comparisons
+summary(art_emm_chao_third$contrasts)
+pw_df_chao_third <- summary(art_emm_chao_third$contrasts)
+letters_df_chao_third <- cldList(p.value ~ contrast, data = pw_df_chao_third, threshold = 0.05)
+
+
+
+
+
+
+
+
+
+
+
+
+print("      permanova with rarefaction at genus level, with aitchinson distance")
+La_Gla_ITS_genus_renamed_perm <- La_Gla_ITS_genus_renamed_pseudo %>%
+  tax_transform("clr", rank = "Genus") %>%
+  dist_calc("euclidean") %>%
+  dist_permanova(
+    variables = c("GlacierID","Sample.Type", "Moraine", "Library_Size", "Location"),
+    n_perms = 999, # you should use more permutations in your real analyses!
+    strata = fun_meta$Plot,
+    n_processes = 1
+  )
+
+La_Gla_ITS_genus_renamed_perm
+
+print("      permanova with rarefaction at genus level, with aitchinson distance, including plot")
+La_Gla_ITS_genus_renamed_perm <- La_Gla_ITS_genus_renamed %>%
+  tax_transform("clr", rank = "Genus") %>%
+  dist_calc("euclidean") %>%
+  dist_permanova(
+    variables = c("Sample.Type", "Moraine", "Library_Size", "Plot"),
+    n_perms = 999, # you should use more permutations in your real analyses!
+    n_processes = 1
+  )
+
+La_Gla_ITS_genus_renamed_perm
+
+#ord_explore(La_Gla_ITS_genus_renamed_pseudo)
+
+#Extract OTU table
+Fun_otu_pseudo <- as.matrix(otu_table(La_Gla_ITS_genus_renamed_pseudo)) 
+Fun_otu_pseudo <- as.data.frame(Fun_otu_pseudo)
+
+#CLR transformation
+Fun_otu_clr <- Fun_otu_pseudo %>%
+  microbiome::transform("clr")
+Fun_otu_clr <- as.data.frame(Fun_otu_clr)
+
+class(Fun_otu_clr)
+
+
+fun_meta <- as.matrix(sample_data(La_Gla_ITS_genus_renamed_pseudo))
+fun_meta <- as.data.frame(fun_meta)
+
+class(fun_meta)
+
+#convert to numeric and factor
+fun_meta$Moraine <- as.factor(fun_meta$Moraine)
+fun_meta$Sample.Type <- as.factor(fun_meta$Sample.Type)
+fun_meta$Location <- as.factor(fun_meta$Location)
+fun_meta$Plot <- as.factor(fun_meta$Plot)
+
+result <- adonis2(Fun_otu_clr ~  Moraine + Sample.Type + Location, data = fun_meta, method="euclidean", strata = fun_meta$Plot ,perm=999)
+print(result)
+
+
+
+#run betadisperse
+# Get Sample.Type grouping variable
+group <- sample_data(La_Gla_ITS_genus_renamed_pseudo)$Sample.Type
+
+# Calculate Bray-Curtis dissimilarity
+euc_dist <- vegdist(Fun_otu_clr, method = "euclidean")
+
+
+# Run beta dispersion
+disper <- betadisper(euc_dist, group)
+
+# Test for significant differences in dispersion
+anova(disper)
+
+plot(disper)
+boxplot(disper, xlab = "Sample Type", ylab = "Distance to Centroid")
+
+
+
+permutest(disper, permutations = 999)
+
+#beta dispersion for ITS, separated by moraine
+
+#extract betadispersion values
+# Get Sample.Type grouping variable
+samp_group <- sample_data(La_Gla_ITS_genus_renamed_pseudo)$Sample.Type
+
+moraine_group <- sample_data(La_Gla_ITS_genus_renamed_pseudo)$Moraine
+
+#create interaction term
+group <- interaction(samp_group, moraine_group)
+
+# Calculate Bray-Curtis dissimilarity
+euc_dist <- vegdist(Fun_otu_clr, method = "euclidean")
+
+
+# Run beta dispersion
+disper <- betadisper(euc_dist, group)
+
+#extract values from disper
+fungi_meta$betaDist <- disper$distances
+
+#now for richness
+mixed_effect_model <- lmer(betaDist ~ Moraine * Sample.Type * Location  + (1|Plot), data = fungi_meta)
+
+# Perform ANOVA using the car package
+anova_result <- Anova(mixed_effect_model, test="F")
+
+# Display the ANOVA table
+print(anova_result)
+
+
+# Create the boxplot
+p_beta <- ggplot(fungi_meta, aes(x = Sample.Type, y = betaDist, color = Sample.Type)) +
+  geom_boxplot(size = 1) +
+  geom_jitter(position = position_jitter(width = 0.2), size = 2, alpha = 0.5) +
+  facet_wrap(~Moraine) +
+  theme_modern() +
+  xlab(NULL) +
+  #ylab("Distance to centroid - 16S") +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    legend.position = "right"
+  )
+
+# Print the plot
+p_beta
+
+# Save as SVG
+ggsave("La_Gla_ITS_genus_renamed_ITS_BetaDisp.svg", p_beta,device = "svg", width = 8, height = 3)
+
+#first moraine w betaDist
+fungi_meta_first_moraine <- fungi_meta[fungi_meta$Moraine_num == 1, ]
+# Fit the ART model (fixed effect: Treatment, random effect: Plot)
+
+
+# Fit the ART model (fixed effect: Treatment, random effect: Plot)
+art_model <- art(betaDist ~  Sample.Type , data = fungi_meta_first_moraine)
+
+
+anova_art <- anova(art_model)
+print(anova_art)
+
+
+# Extract the aligned model (for Treatment)
+art_emm <- emmeans(artlm(art_model, "Sample.Type"), pairwise ~ Sample.Type, adjust = "fdr")
+
+# See pairwise comparisons
+summary(art_emm$contrasts)
+
+pw_df <- summary(art_emm$contrasts)
+
+letters_df <- cldList(p.value ~ contrast, data = pw_df, threshold = 0.05)
+
+#second moraine w betaDist
+fungi_meta_second_moraine <- fungi_meta[fungi_meta$Moraine_num == 2, ]
+# Fit the ART model (fixed effect: Treatment, random effect: Plot)
+
+
+# Fit the ART model (fixed effect: Treatment, random effect: Plot)
+art_model <- art(betaDist ~  Sample.Type , data = fungi_meta_second_moraine)
+
+
+anova_art <- anova(art_model)
+print(anova_art)
+
+
+# Extract the aligned model (for Treatment)
+art_emm <- emmeans(artlm(art_model, "Sample.Type"), pairwise ~ Sample.Type, adjust = "fdr")
+
+# See pairwise comparisons
+summary(art_emm$contrasts)
+
+pw_df <- summary(art_emm$contrasts)
+
+letters_df <- cldList(p.value ~ contrast, data = pw_df, threshold = 0.05)
+
+
+#third moraine w betaDist
+fungi_meta_third_moraine <- fungi_meta[fungi_meta$Moraine_num == 3, ]
+# Fit the ART model (fixed effect: Treatment, random effect: Plot)
+
+
+# Fit the ART model (fixed effect: Treatment, random effect: Plot)
+art_model <- art(betaDist ~  Sample.Type , data = fungi_meta_third_moraine)
+
+
+anova_art <- anova(art_model)
+print(anova_art)
+
+
+# Extract the aligned model (for Treatment)
+art_emm <- emmeans(artlm(art_model, "Sample.Type"), pairwise ~ Sample.Type, adjust = "fdr")
+
+# See pairwise comparisons
+summary(art_emm$contrasts)
+
+pw_df <- summary(art_emm$contrasts)
+
+letters_df <- cldList(p.value ~ contrast, data = pw_df, threshold = 0.05)
+
+
+
+
+
+
+```
+
+
+#Explore Venn diagrams at the genera level
+```{r, echo=FALSE}
+
+#La_Gla_ITS_genus_renamed
+
+# Agglomerate by Genus
+La_Gla_ITS_genus <- tax_glom(La_Gla_ITS_genus_renamed, taxrank = "Genus")
+
+# Convert ASV/OTU names to genus names
+taxa_names(La_Gla_ITS_genus) <- as.character(tax_table(La_Gla_ITS_genus)[, "Genus"])
+
+ITS_BS <- subset_samples(La_Gla_ITS_genus, Sample.Type == "Bulk Soil")
+ITS_moss <- subset_samples(La_Gla_ITS_genus, Sample.Type == "Moss")
+ITS_SC <- subset_samples(La_Gla_ITS_genus, Sample.Type == "Soil Crust")
+ITS_Pla <- subset_samples(La_Gla_ITS_genus, Sample.Type == "Plant")
+ITS_Lic <- subset_samples(La_Gla_ITS_genus, Sample.Type == "Lichen")
+
+Bac_BS <- subset_samples(La_Gla_16S_genus_renamed, Sample.Type == "Bulk Soil")
+Bac_moss <- subset_samples(La_Gla_16S_genus_renamed, Sample.Type == "Moss")
+Bac_SC <- subset_samples(La_Gla_16S_genus_renamed, Sample.Type == "Soil Crust")
+Bac_Pla <- subset_samples(La_Gla_16S_genus_renamed, Sample.Type == "Plant")
+Bac_Lic <- subset_samples(La_Gla_16S_genus_renamed, Sample.Type == "Lichen")
+
+library(phyloseq)
+library(dplyr)
+library(tibble)
+
+get_top5_genera <- function(physeq_object) {
+  # Transform to relative abundance
+  physeq_rel <- transform_sample_counts(physeq_object, function(x) x / sum(x))
+  
+  # Agglomerate to Genus level
+  physeq_genus <- tax_glom(physeq_rel, taxrank = "Genus", NArm = TRUE)
+
+  # Extract the abundance matrix (ensure taxa are rows)
+  abund <- t(as(otu_table(physeq_rel), "matrix"))
+
+  
+  # Extract the tax table from the genus-level phyloseq object
+  taxa <- as(tax_table(physeq_rel), "matrix")
+  
+  # Calculate mean and max abundance
+  genus_stats <- data.frame(
+    Genus = taxa[, "Genus"],
+    MeanAbundance = rowMeans(abund),
+    MaxAbundance = apply(abund, 1, max),
+    stringsAsFactors = FALSE
+  )
+  
+  # Combine with full taxonomy
+  taxonomy_df <- as.data.frame(taxa)
+  genus_stats <- cbind(genus_stats, taxonomy_df)
+  
+  
+  
+  # Return top 5 by mean abundance
+  
+  
+  return(genus_stats)
+}
+
+# Run for each sample type
+top_BS <- get_top5_genera(ITS_BS)
+top_Moss <- get_top5_genera(ITS_moss)
+top_SC <- get_top5_genera(ITS_SC)
+top_Pla <- get_top5_genera(ITS_Pla)
+top_Lic <- get_top5_genera(ITS_Lic)
+
+# View result
+Bac_top_BS <- get_top5_genera(Bac_BS)
+Bac_top_Moss <- get_top5_genera(Bac_moss)
+Bac_top_SC <- get_top5_genera(Bac_SC)
+Bac_top_Pla <- get_top5_genera(Bac_Pla)
+Bac_top_Lic <- get_top5_genera(Bac_Lic)
+
+
+
+otus_BS <- taxa_names(prune_taxa(taxa_sums(ITS_BS) > 0, ITS_BS))
+otus_Moss <- taxa_names(prune_taxa(taxa_sums(ITS_moss) > 0, ITS_moss))
+otus_SC <- taxa_names(prune_taxa(taxa_sums(ITS_SC) > 0, ITS_SC))
+otus_Pla <- taxa_names(prune_taxa(taxa_sums(ITS_Pla) > 0, ITS_Pla))
+otus_Lic <- taxa_names(prune_taxa(taxa_sums(ITS_Lic) > 0, ITS_Lic))
+
+venn <- venn.diagram(
+  x = list(BS = otus_BS, Moss = otus_Moss, Soil_Crust = otus_SC, Plants = otus_Pla, Lichen = otus_Lic),
+  category.names = c("Bulk Soil", "Moss", "Soil Crust", "Plant", "Lichen"),
+  filename = "VennDiagram_all_ITS_genus.png",
+  output = TRUE,
+    main = "Venn Diagram of Fungal Genera across all Moraines",  # Add title here
+  main.cex = 1  # Adjust title size (optional)
+)
+
+# Convert to presence-absence
+ITS_unique <- transform_sample_counts(La_Gla_ITS_genus, function(x) ifelse(x > 0, 1, 0))
+
+# Convert to a matrix for easier processing
+otu_matrix <- as(otu_table(ITS_unique), "matrix")
+
+# Convert to data frame for manipulation
+otu_df <- as.data.frame(otu_matrix)
+
+# Sum presence across samples per taxon
+otu_sums <- rowSums(otu_df)
+
+# Identify unique taxa for each group
+unique_taxa <- list()
+
+for (group in colnames(otu_df)) {
+  unique_taxa[[group]] <- rownames(otu_df)[otu_df[, group] == 1 & otu_sums == 1]
+}
+
+# Print unique taxa per group
+unique_taxa
+
+
+```
+
+
+
+
+```{r, venn diagrams for separate moraines - fungi}
+#Fungi First Moraine Venn Diagrams
+# Example: Subset phyloseq object based on sample groups
+ITS_morA <- subset_samples(La_Gla_ITS_genus, Moraine == "A")
+Meta_ITS_A <- sample_data(ITS_morA)
+
+ITS_morA <- prune_taxa(taxa_sums(ITS_morA) > 0, ITS_morA)
+
+ntaxa(ITS_morA)
+
+ITS_morA_BS <- subset_samples(ITS_morA, Sample.Type == "Bulk Soil")
+ITS_morA_moss <- subset_samples(ITS_morA, Sample.Type == "Moss")
+ITS_morA_SC <- subset_samples(ITS_morA, Sample.Type == "Soil Crust")
+ITS_morA_Pla <- subset_samples(ITS_morA, Sample.Type == "Plant")
+ITS_morA_Lic <- subset_samples(ITS_morA, Sample.Type == "Lichen")
+
+otus_BS <- taxa_names(prune_taxa(taxa_sums(ITS_morA_BS) > 0, ITS_morA_BS))
+otus_Moss <- taxa_names(prune_taxa(taxa_sums(ITS_morA_moss) > 0, ITS_morA_moss))
+otus_SC <- taxa_names(prune_taxa(taxa_sums(ITS_morA_SC) > 0, ITS_morA_SC))
+otus_Pla <- taxa_names(prune_taxa(taxa_sums(ITS_morA_Pla) > 0, ITS_morA_Pla))
+otus_Lic <- taxa_names(prune_taxa(taxa_sums(ITS_morA_Lic) > 0, ITS_morA_Lic))
+
+venn <- venn.diagram(
+  x = list(BS = otus_BS, Moss = otus_Moss, Soil_Crust = otus_SC, Plants = otus_Pla, Lichen = otus_Lic),
+  category.names = c("Bulk Soil", "Moss", "Soil Crust", "Plant", "Lichen"),
+  filename = "VennDiagram_ITS_A.png",
+  output = TRUE,
+    main = "Venn Diagram of Fungal Genera on the First Moraines",  # Add title here
+  main.cex = 1  # Adjust title size (optional)
+)
+
+
+#Fungi First Second Moraine Venn Diagrams
+# Example: Subset phyloseq object based on sample groups
+ITS_morB <- subset_samples(La_Gla_ITS_genus, Moraine == "B")
+Meta_ITS_B <- sample_data(ITS_morB)
+
+ITS_morB <- prune_taxa(taxa_sums(ITS_morB) > 0, ITS_morB)
+
+ntaxa(ITS_morB)
+
+ITS_morB_BS <- subset_samples(ITS_morB, Sample.Type == "Bulk Soil")
+ITS_morB_moss <- subset_samples(ITS_morB, Sample.Type == "Moss")
+ITS_morB_SC <- subset_samples(ITS_morB, Sample.Type == "Soil Crust")
+ITS_morB_Pla <- subset_samples(ITS_morB, Sample.Type == "Plant")
+ITS_morB_Lic <- subset_samples(ITS_morB, Sample.Type == "Lichen")
+
+otus_BS <- taxa_names(prune_taxa(taxa_sums(ITS_morB_BS) > 0, ITS_morB_BS))
+otus_Moss <- taxa_names(prune_taxa(taxa_sums(ITS_morB_moss) > 0, ITS_morB_moss))
+otus_SC <- taxa_names(prune_taxa(taxa_sums(ITS_morB_SC) > 0, ITS_morB_SC))
+otus_Pla <- taxa_names(prune_taxa(taxa_sums(ITS_morB_Pla) > 0, ITS_morB_Pla))
+otus_Lic <- taxa_names(prune_taxa(taxa_sums(ITS_morB_Lic) > 0, ITS_morB_Lic))
+
+venn <- venn.diagram(
+  x = list(BS = otus_BS, Moss = otus_Moss, Soil_Crust = otus_SC, Plants = otus_Pla, Lichen = otus_Lic),
+  category.names = c("Bulk Soil", "Moss", "Soil Crust", "Plant", "Lichen"),
+  filename = "VennDiagram_ITS_B.png",
+  output = TRUE,
+    main = "Venn Diagram of Fungal Genera on the Second Moraines",  # Add title here
+  main.cex = 1  # Adjust title size (optional)
+)
+
+
+
+#Fungi  Third Moraine Venn Diagrams
+# Example: Subset phyloseq object based on sample groups
+ITS_morC <- subset_samples(La_Gla_ITS_genus, Moraine == "C")
+Meta_ITS_C <- sample_data(ITS_morC)
+
+ITS_morC <- prune_taxa(taxa_sums(ITS_morC) > 0, ITS_morC)
+
+ntaxa(ITS_morC)
+
+ITS_morC_BS <- subset_samples(ITS_morC, Sample.Type == "Bulk Soil")
+ITS_morC_moss <- subset_samples(ITS_morC, Sample.Type == "Moss")
+ITS_morC_SC <- subset_samples(ITS_morC, Sample.Type == "Soil Crust")
+ITS_morC_Pla <- subset_samples(ITS_morC, Sample.Type == "Plant")
+ITS_morC_Lic <- subset_samples(ITS_morC, Sample.Type == "Lichen")
+
+otus_BS <- taxa_names(prune_taxa(taxa_sums(ITS_morC_BS) > 0, ITS_morC_BS))
+otus_Moss <- taxa_names(prune_taxa(taxa_sums(ITS_morC_moss) > 0, ITS_morC_moss))
+otus_SC <- taxa_names(prune_taxa(taxa_sums(ITS_morC_SC) > 0, ITS_morC_SC))
+otus_Pla <- taxa_names(prune_taxa(taxa_sums(ITS_morC_Pla) > 0, ITS_morC_Pla))
+otus_Lic <- taxa_names(prune_taxa(taxa_sums(ITS_morC_Lic) > 0, ITS_morC_Lic))
+
+
+venn <- venn.diagram(
+  x = list(BS = otus_BS, Moss = otus_Moss, Soil_Crust = otus_SC, Plants = otus_Pla, Lichen = otus_Lic),
+  category.names = c("Bulk Soil", "Moss", "Soil Crust", "Plant", "Lichen"),
+  filename = "VennDiagram_ITS_C.png",
+  output = TRUE,
+    main = "Venn Diagram of Fungal Genera on the Third Moraines",  # Add title here
+  main.cex = 1  # Adjust title size (optional)
+)
+
+
+
+
+#Bacterial Venn Diagrams
+
+# Agglomerate by Genus
+La_Gla_16S_genus <- tax_glom(La_Gla_16S_genus_renamed, taxrank = "Genus")
+
+# Convert ASV/OTU names to genus names
+taxa_names(La_Gla_16S_genus) <- as.character(tax_table(La_Gla_16S_genus)[, "Genus"])
+
+Bac_BS <- subset_samples(La_Gla_16S_genus, Sample.Type == "Bulk Soil")
+Bac_moss <- subset_samples(La_Gla_16S_genus, Sample.Type == "Moss")
+Bac_SC <- subset_samples(La_Gla_16S_genus, Sample.Type == "Soil Crust")
+Bac_Pla <- subset_samples(La_Gla_16S_genus, Sample.Type == "Plant")
+Bac_Lic <- subset_samples(La_Gla_16S_genus, Sample.Type == "Lichen")
+
+otus_BS <- taxa_names(prune_taxa(taxa_sums(Bac_BS) > 0, Bac_BS))
+otus_Moss <- taxa_names(prune_taxa(taxa_sums(Bac_moss) > 0, Bac_moss))
+otus_SC <- taxa_names(prune_taxa(taxa_sums(Bac_SC) > 0, Bac_SC))
+otus_Pla <- taxa_names(prune_taxa(taxa_sums(Bac_Pla) > 0, Bac_Pla))
+otus_Lic <- taxa_names(prune_taxa(taxa_sums(Bac_Lic) > 0, Bac_Lic))
+
+venn <- venn.diagram(
+  x = list(BS = otus_BS, Moss = otus_Moss, Soil_Crust = otus_SC, Plants = otus_Pla, Lichen = otus_Lic),
+  category.names = c("Bulk Soil", "Moss", "Soil Crust", "Plant", "Lichen"),
+  filename = "VennDiagram_all_Bac_genus.png",
+  output = TRUE,
+    main = "Venn Diagram of Bacterial Genera across all Moraines",  # Add title here
+  main.cex = 1  # Adjust title size (optional)
+)
+
+#Bacteria First Moraine Venn Diagrams
+# Example: Subset phyloseq object based on sample groups
+Bac_morA <- subset_samples(La_Gla_16S_genus, Moraine == "A")
+Meta_Bac_A <- sample_data(Bac_morA)
+
+Bac_morA <- prune_taxa(taxa_sums(Bac_morA) > 0, Bac_morA)
+
+ntaxa(Bac_morA)
+
+Bac_morA_BS <- subset_samples(Bac_morA, Sample.Type == "Bulk Soil")
+Bac_morA_moss <- subset_samples(Bac_morA, Sample.Type == "Moss")
+Bac_morA_SC <- subset_samples(Bac_morA, Sample.Type == "Soil Crust")
+Bac_morA_Pla <- subset_samples(Bac_morA, Sample.Type == "Plant")
+Bac_morA_Lic <- subset_samples(Bac_morA, Sample.Type == "Lichen")
+
+otus_BS <- taxa_names(prune_taxa(taxa_sums(Bac_morA_BS) > 0, Bac_morA_BS))
+otus_Moss <- taxa_names(prune_taxa(taxa_sums(Bac_morA_moss) > 0, Bac_morA_moss))
+otus_SC <- taxa_names(prune_taxa(taxa_sums(Bac_morA_SC) > 0, Bac_morA_SC))
+otus_Pla <- taxa_names(prune_taxa(taxa_sums(Bac_morA_Pla) > 0, Bac_morA_Pla))
+otus_Lic <- taxa_names(prune_taxa(taxa_sums(Bac_morA_Lic) > 0, Bac_morA_Lic))
+
+venn <- venn.diagram(
+  x = list(BS = otus_BS, Moss = otus_Moss, Soil_Crust = otus_SC, Plants = otus_Pla, Lichen = otus_Lic),
+  category.names = c("Bulk Soil", "Moss", "Soil Crust", "Plant", "Lichen"),
+  filename = "VennDiagram_16S_A.png",
+  output = TRUE,
+    main = "Venn Diagram of Bacterial Genera on the First Moraines",  # Add title here
+  main.cex = 1  # Adjust title size (optional)
+)
+
+#Bacteria Second Moraine Venn Diagrams
+# Example: Subset phyloseq object based on sample groups
+Bac_morB <- subset_samples(La_Gla_16S_genus, Moraine == "B")
+Meta_Bac_B <- sample_data(Bac_morB)
+
+Bac_morB <- prune_taxa(taxa_sums(Bac_morB) > 0, Bac_morB)
+
+ntaxa(Bac_morB)
+
+Bac_morB_BS <- subset_samples(Bac_morB, Sample.Type == "Bulk Soil")
+Bac_morB_moss <- subset_samples(Bac_morB, Sample.Type == "Moss")
+Bac_morB_SC <- subset_samples(Bac_morB, Sample.Type == "Soil Crust")
+Bac_morB_Pla <- subset_samples(Bac_morB, Sample.Type == "Plant")
+Bac_morB_Lic <- subset_samples(Bac_morB, Sample.Type == "Lichen")
+
+otus_BS <- taxa_names(prune_taxa(taxa_sums(Bac_morB_BS) > 0, Bac_morB_BS))
+otus_Moss <- taxa_names(prune_taxa(taxa_sums(Bac_morB_moss) > 0, Bac_morB_moss))
+otus_SC <- taxa_names(prune_taxa(taxa_sums(Bac_morB_SC) > 0, Bac_morB_SC))
+otus_Pla <- taxa_names(prune_taxa(taxa_sums(Bac_morB_Pla) > 0, Bac_morB_Pla))
+otus_Lic <- taxa_names(prune_taxa(taxa_sums(Bac_morB_Lic) > 0, Bac_morB_Lic))
+
+venn <- venn.diagram(
+  x = list(BS = otus_BS, Moss = otus_Moss, Soil_Crust = otus_SC, Plants = otus_Pla, Lichen = otus_Lic),
+  category.names = c("Bulk Soil", "Moss", "Soil Crust", "Plant", "Lichen"),
+  filename = "VennDiagram_16S_B.png",
+  output = TRUE,
+    main = "Venn Diagram of Bacterial Genera on the Second Moraines",  # Add title here
+  main.cex = 1  # Adjust title size (optional)
+)
+
+
+#Bacteria Third Moraine Venn Diagrams
+# Example: Subset phyloseq object based on sample groups
+Bac_morC <- subset_samples(La_Gla_16S_genus, Moraine == "C")
+Meta_Bac_C <- sample_data(Bac_morC)
+
+Bac_morC <- prune_taxa(taxa_sums(Bac_morC) > 0, Bac_morC)
+
+ntaxa(Bac_morC)
+
+Bac_morC_BS <- subset_samples(Bac_morC, Sample.Type == "Bulk Soil")
+Bac_morC_moss <- subset_samples(Bac_morC, Sample.Type == "Moss")
+Bac_morC_SC <- subset_samples(Bac_morC, Sample.Type == "Soil Crust")
+Bac_morC_Pla <- subset_samples(Bac_morC, Sample.Type == "Plant")
+Bac_morC_Lic <- subset_samples(Bac_morC, Sample.Type == "Lichen")
+
+otus_BS <- taxa_names(prune_taxa(taxa_sums(Bac_morC_BS) > 0, Bac_morC_BS))
+otus_Moss <- taxa_names(prune_taxa(taxa_sums(Bac_morC_moss) > 0, Bac_morC_moss))
+otus_SC <- taxa_names(prune_taxa(taxa_sums(Bac_morC_SC) > 0, Bac_morC_SC))
+otus_Pla <- taxa_names(prune_taxa(taxa_sums(Bac_morC_Pla) > 0, Bac_morC_Pla))
+otus_Lic <- taxa_names(prune_taxa(taxa_sums(Bac_morC_Lic) > 0, Bac_morC_Lic))
+
+venn <- venn.diagram(
+  x = list(BS = otus_BS, Moss = otus_Moss, Soil_Crust = otus_SC, Plants = otus_Pla, Lichen = otus_Lic),
+  category.names = c("Bulk Soil", "Moss", "Soil Crust", "Plant", "Lichen"),
+  filename = "VennDiagram_16S_C.png",
+  output = TRUE,
+    main = "Venn Diagram of Bacterial Genera on the Third Moraines",  # Add title here
+  main.cex = 1  # Adjust title size (optional)
+)
+
+
+```
+
+
+```{r, echo=FALSE}
+#La_Gla_ITS_family_renamed
+
+# Agglomerate by Family
+La_Gla_ITS_family <- tax_glom(La_Gla_ITS_genus_renamed, taxrank = "Family")
+
+
+
+# Convert ASV/OTU names to family names
+taxa_names(La_Gla_ITS_family) <- as.character(tax_table(La_Gla_ITS_family)[, "Family"])
+
+ITS_BS <- subset_samples(La_Gla_ITS_family, Sample.Type == "Bulk Soil")
+ITS_moss <- subset_samples(La_Gla_ITS_family, Sample.Type == "Moss")
+ITS_SC <- subset_samples(La_Gla_ITS_family, Sample.Type == "Soil Crust")
+ITS_Pla <- subset_samples(La_Gla_ITS_family, Sample.Type == "Plant")
+ITS_Lic <- subset_samples(La_Gla_ITS_family, Sample.Type == "Lichen")
+
+otus_BS <- taxa_names(prune_taxa(taxa_sums(ITS_BS) > 0, ITS_BS))
+otus_Moss <- taxa_names(prune_taxa(taxa_sums(ITS_moss) > 0, ITS_moss))
+otus_SC <- taxa_names(prune_taxa(taxa_sums(ITS_SC) > 0, ITS_SC))
+otus_Pla <- taxa_names(prune_taxa(taxa_sums(ITS_Pla) > 0, ITS_Pla))
+otus_Lic <- taxa_names(prune_taxa(taxa_sums(ITS_Lic) > 0, ITS_Lic))
+
+venn <- venn.diagram(
+  x = list(BS = otus_BS, Moss = otus_Moss, Soil_Crust = otus_SC, Plants = otus_Pla, Lichen = otus_Lic),
+  category.names = c("Bulk Soil", "Moss", "Soil Crust", "Plant", "Lichen"),
+  filename = "VennDiagram_all_fam.png",
+  output = TRUE,
+    main = "Venn Diagram of Fungal Families across all Moraines",  # Add title here
+  main.cex = 1  # Adjust title size (optional)
+)
+
+#Fungi First Moraine Venn Diagrams
+# Example: Subset phyloseq object based on sample groups
+ITS_morA <- subset_samples(La_Gla_ITS_family, Moraine == "A")
+ITS_morA <- prune_taxa(taxa_sums(ITS_morA) > 0, ITS_morA)
+
+ntaxa(ITS_morA)
+
+venn <- venn.diagram(
+  x = list(BS = otus_BS, Moss = otus_Moss, Soil_Crust = otus_SC, Plants = otus_Pla, Lichen = otus_Lic),
+  category.names = c("Bulk Soil", "Moss", "Soil Crust", "Plant", "Lichen"),
+  filename = "VennDiagram_ITS_B_fam.png",
+  output = TRUE,
+    main = "Venn Diagram of Fungal Families on the Second Moraines",  # Add title here
+  main.cex = 1  # Adjust title size (optional)
+)
+
+Meta_ITS_A <- sample_data(ITS_morA)
+
+ITS_morA_BS <- subset_samples(ITS_morA, Sample.Type == "Bulk Soil")
+ITS_morA_moss <- subset_samples(ITS_morA, Sample.Type == "Moss")
+ITS_morA_SC <- subset_samples(ITS_morA, Sample.Type == "Soil Crust")
+ITS_morA_Pla <- subset_samples(ITS_morA, Sample.Type == "Plant")
+ITS_morA_Lic <- subset_samples(ITS_morA, Sample.Type == "Lichen")
+
+otus_BS <- taxa_names(prune_taxa(taxa_sums(ITS_morA_BS) > 0, ITS_morA_BS))
+otus_Moss <- taxa_names(prune_taxa(taxa_sums(ITS_morA_moss) > 0, ITS_morA_moss))
+otus_SC <- taxa_names(prune_taxa(taxa_sums(ITS_morA_SC) > 0, ITS_morA_SC))
+otus_Pla <- taxa_names(prune_taxa(taxa_sums(ITS_morA_Pla) > 0, ITS_morA_Pla))
+otus_Lic <- taxa_names(prune_taxa(taxa_sums(ITS_morA_Lic) > 0, ITS_morA_Lic))
+
+venn <- venn.diagram(
+  x = list(BS = otus_BS, Moss = otus_Moss, Soil_Crust = otus_SC, Plants = otus_Pla, Lichen = otus_Lic),
+  category.names = c("Bulk Soil", "Moss", "Soil Crust", "Plant", "Lichen"),
+  filename = "VennDiagram_ITS_A_fam.png",
+  output = TRUE,
+    main = "Venn Diagram of Fungal Families on the First Moraines",  # Add title here
+  main.cex = 1  # Adjust title size (optional)
+)
+
+
+#Fungi First Second Moraine Venn Diagrams
+# Example: Subset phyloseq object based on sample groups
+ITS_morB <- subset_samples(La_Gla_ITS_family, Moraine == "B")
+Meta_ITS_B <- sample_data(ITS_morB)
+
+ITS_morB <- prune_taxa(taxa_sums(ITS_morB) > 0, ITS_morB)
+
+ntaxa(ITS_morB)
+
+ITS_morB_BS <- subset_samples(ITS_morB, Sample.Type == "Bulk Soil")
+ITS_morB_moss <- subset_samples(ITS_morB, Sample.Type == "Moss")
+ITS_morB_SC <- subset_samples(ITS_morB, Sample.Type == "Soil Crust")
+ITS_morB_Pla <- subset_samples(ITS_morB, Sample.Type == "Plant")
+ITS_morB_Lic <- subset_samples(ITS_morB, Sample.Type == "Lichen")
+
+otus_BS <- taxa_names(prune_taxa(taxa_sums(ITS_morB_BS) > 0, ITS_morB_BS))
+otus_Moss <- taxa_names(prune_taxa(taxa_sums(ITS_morB_moss) > 0, ITS_morB_moss))
+otus_SC <- taxa_names(prune_taxa(taxa_sums(ITS_morB_SC) > 0, ITS_morB_SC))
+otus_Pla <- taxa_names(prune_taxa(taxa_sums(ITS_morB_Pla) > 0, ITS_morB_Pla))
+otus_Lic <- taxa_names(prune_taxa(taxa_sums(ITS_morB_Lic) > 0, ITS_morB_Lic))
+
+venn <- venn.diagram(
+  x = list(BS = otus_BS, Moss = otus_Moss, Soil_Crust = otus_SC, Plants = otus_Pla, Lichen = otus_Lic),
+  category.names = c("Bulk Soil", "Moss", "Soil Crust", "Plant", "Lichen"),
+  filename = "VennDiagram_ITS_B_fam.png",
+  output = TRUE,
+    main = "Venn Diagram of Fungal Families on the Second Moraines",  # Add title here
+  main.cex = 1  # Adjust title size (optional)
+)
+
+
+
+#Fungi  Third Moraine Venn Diagrams
+# Example: Subset phyloseq object based on sample groups
+ITS_morC <- subset_samples(La_Gla_ITS_family, Moraine == "C")
+Meta_ITS_C <- sample_data(ITS_morC)
+
+ITS_morC <- prune_taxa(taxa_sums(ITS_morC) > 0, ITS_morC)
+
+ntaxa(ITS_morC)
+
+ITS_morC_BS <- subset_samples(ITS_morC, Sample.Type == "Bulk Soil")
+ITS_morC_moss <- subset_samples(ITS_morC, Sample.Type == "Moss")
+ITS_morC_SC <- subset_samples(ITS_morC, Sample.Type == "Soil Crust")
+ITS_morC_Pla <- subset_samples(ITS_morC, Sample.Type == "Plant")
+ITS_morC_Lic <- subset_samples(ITS_morC, Sample.Type == "Lichen")
+
+otus_BS <- taxa_names(prune_taxa(taxa_sums(ITS_morC_BS) > 0, ITS_morC_BS))
+otus_Moss <- taxa_names(prune_taxa(taxa_sums(ITS_morC_moss) > 0, ITS_morC_moss))
+otus_SC <- taxa_names(prune_taxa(taxa_sums(ITS_morC_SC) > 0, ITS_morC_SC))
+otus_Pla <- taxa_names(prune_taxa(taxa_sums(ITS_morC_Pla) > 0, ITS_morC_Pla))
+otus_Lic <- taxa_names(prune_taxa(taxa_sums(ITS_morC_Lic) > 0, ITS_morC_Lic))
+
+
+venn <- venn.diagram(
+  x = list(BS = otus_BS, Moss = otus_Moss, Soil_Crust = otus_SC, Plants = otus_Pla, Lichen = otus_Lic),
+  category.names = c("Bulk Soil", "Moss", "Soil Crust", "Plant", "Lichen"),
+  filename = "VennDiagram_ITS_C_fam.png",
+  output = TRUE,
+    main = "Venn Diagram of Fungal Families on the Third Moraines",  # Add title here
+  main.cex = 1  # Adjust title size (optional)
+)
+
+
+
+
+#Bacterial Venn Diagrams
+
+# # Agglomerate by order
+# La_Gla_16S_order <- tax_glom(La_Gla_16S_genus_renamed, taxrank = "Order")
+# #tax_fix_interactive(La_Gla_16S_order)
+# 
+# # Convert ASV/OTU names to order names
+# taxa_names(La_Gla_16S_order) <- as.character(tax_table(La_Gla_16S_order)[, "Order"])
+# 
+# Bac_BS <- subset_samples(La_Gla_16S_family, Sample.Type == "Bulk Soil")
+# Bac_moss <- subset_samples(La_Gla_16S_family, Sample.Type == "Moss")
+# Bac_SC <- subset_samples(La_Gla_16S_family, Sample.Type == "Soil Crust")
+# Bac_Pla <- subset_samples(La_Gla_16S_family, Sample.Type == "Plant")
+# Bac_Lic <- subset_samples(La_Gla_16S_family, Sample.Type == "Lichen")
+# 
+# otus_BS <- taxa_names(prune_taxa(taxa_sums(Bac_BS) > 0, Bac_BS))
+# otus_Moss <- taxa_names(prune_taxa(taxa_sums(Bac_moss) > 0, Bac_moss))
+# otus_SC <- taxa_names(prune_taxa(taxa_sums(Bac_SC) > 0, Bac_SC))
+# otus_Pla <- taxa_names(prune_taxa(taxa_sums(Bac_Pla) > 0, Bac_Pla))
+# otus_Lic <- taxa_names(prune_taxa(taxa_sums(Bac_Lic) > 0, Bac_Lic))
+# 
+# venn <- venn.diagram(
+#   x = list(BS = otus_BS, Moss = otus_Moss, Soil_Crust = otus_SC, Plants = otus_Pla, Lichen = otus_Lic),
+#   category.names = c("Bulk Soil", "Moss", "Soil Crust", "Plant", "Lichen"),
+#   filename = "VennDiagram_all_Bac_order.png",
+#   output = TRUE,
+#     main = "Venn Diagram of Bacterial Orders across all Moraines",  # Add title here
+#   main.cex = 1  # Adjust title size (optional)
+# )
+# 
+# #Bacteria First Moraine Venn Diagrams
+# # Example: Subset phyloseq object based on sample groups
+# Bac_morA <- subset_samples(La_Gla_16S_order, Moraine == "A")
+# Meta_Bac_A <- sample_data(Bac_morA)
+# 
+# Bac_morA <- prune_taxa(taxa_sums(Bac_morA) > 0, Bac_morA)
+# 
+# ntaxa(Bac_morA)
+# 
+# Bac_morA_BS <- subset_samples(Bac_morA, Sample.Type == "Bulk Soil")
+# Bac_morA_moss <- subset_samples(Bac_morA, Sample.Type == "Moss")
+# Bac_morA_SC <- subset_samples(Bac_morA, Sample.Type == "Soil Crust")
+# Bac_morA_Pla <- subset_samples(Bac_morA, Sample.Type == "Plant")
+# Bac_morA_Lic <- subset_samples(Bac_morA, Sample.Type == "Lichen")
+# 
+# otus_BS <- taxa_names(prune_taxa(taxa_sums(Bac_morA_BS) > 0, Bac_morA_BS))
+# otus_Moss <- taxa_names(prune_taxa(taxa_sums(Bac_morA_moss) > 0, Bac_morA_moss))
+# otus_SC <- taxa_names(prune_taxa(taxa_sums(Bac_morA_SC) > 0, Bac_morA_SC))
+# otus_Pla <- taxa_names(prune_taxa(taxa_sums(Bac_morA_Pla) > 0, Bac_morA_Pla))
+# otus_Lic <- taxa_names(prune_taxa(taxa_sums(Bac_morA_Lic) > 0, Bac_morA_Lic))
+# 
+# venn <- venn.diagram(
+#   x = list(BS = otus_BS, Moss = otus_Moss, Soil_Crust = otus_SC, Plants = otus_Pla, Lichen = otus_Lic),
+#   category.names = c("Bulk Soil", "Moss", "Soil Crust", "Plant", "Lichen"),
+#   filename = "VennDiagram_16S_A_order.png",
+#   output = TRUE,
+#     main = "Venn Diagram of Bacterial Orders on the First Moraines",  # Add title here
+#   main.cex = 1  # Adjust title size (optional)
+# )
+# 
+# #Bacteria Second Moraine Venn Diagrams
+# # Example: Subset phyloseq object based on sample groups
+# Bac_morB <- subset_samples(La_Gla_16S_order, Moraine == "B")
+# Meta_Bac_B <- sample_data(Bac_morB)
+# 
+# Bac_morB <- prune_taxa(taxa_sums(Bac_morB) > 0, Bac_morB)
+# 
+# ntaxa(Bac_morB)
+# 
+# Bac_morB_BS <- subset_samples(Bac_morB, Sample.Type == "Bulk Soil")
+# Bac_morB_moss <- subset_samples(Bac_morB, Sample.Type == "Moss")
+# Bac_morB_SC <- subset_samples(Bac_morB, Sample.Type == "Soil Crust")
+# Bac_morB_Pla <- subset_samples(Bac_morB, Sample.Type == "Plant")
+# Bac_morB_Lic <- subset_samples(Bac_morB, Sample.Type == "Lichen")
+# 
+# otus_BS <- taxa_names(prune_taxa(taxa_sums(Bac_morB_BS) > 0, Bac_morB_BS))
+# otus_Moss <- taxa_names(prune_taxa(taxa_sums(Bac_morB_moss) > 0, Bac_morB_moss))
+# otus_SC <- taxa_names(prune_taxa(taxa_sums(Bac_morB_SC) > 0, Bac_morB_SC))
+# otus_Pla <- taxa_names(prune_taxa(taxa_sums(Bac_morB_Pla) > 0, Bac_morB_Pla))
+# otus_Lic <- taxa_names(prune_taxa(taxa_sums(Bac_morB_Lic) > 0, Bac_morB_Lic))
+# 
+# venn <- venn.diagram(
+#   x = list(BS = otus_BS, Moss = otus_Moss, Soil_Crust = otus_SC, Plants = otus_Pla, Lichen = otus_Lic),
+#   category.names = c("Bulk Soil", "Moss", "Soil Crust", "Plant", "Lichen"),
+#   filename = "VennDiagram_16S_B_order.png",
+#   output = TRUE,
+#     main = "Venn Diagram of Bacterial Orders on the Second Moraines",  # Add title here
+#   main.cex = 1  # Adjust title size (optional)
+# )
+# 
+# 
+# #Bacteria Third Moraine Venn Diagrams
+# # Example: Subset phyloseq object based on sample groups
+# Bac_morC <- subset_samples(La_Gla_16S_order, Moraine == "C")
+# Meta_Bac_C <- sample_data(Bac_morC)
+# 
+# Bac_morC <- prune_taxa(taxa_sums(Bac_morC) > 0, Bac_morC)
+# 
+# ntaxa(Bac_morC)
+# 
+# Bac_morC_BS <- subset_samples(Bac_morC, Sample.Type == "Bulk Soil")
+# Bac_morC_moss <- subset_samples(Bac_morC, Sample.Type == "Moss")
+# Bac_morC_SC <- subset_samples(Bac_morC, Sample.Type == "Soil Crust")
+# Bac_morC_Pla <- subset_samples(Bac_morC, Sample.Type == "Plant")
+# Bac_morC_Lic <- subset_samples(Bac_morC, Sample.Type == "Lichen")
+# 
+# otus_BS <- taxa_names(prune_taxa(taxa_sums(Bac_morC_BS) > 0, Bac_morC_BS))
+# otus_Moss <- taxa_names(prune_taxa(taxa_sums(Bac_morC_moss) > 0, Bac_morC_moss))
+# otus_SC <- taxa_names(prune_taxa(taxa_sums(Bac_morC_SC) > 0, Bac_morC_SC))
+# otus_Pla <- taxa_names(prune_taxa(taxa_sums(Bac_morC_Pla) > 0, Bac_morC_Pla))
+# otus_Lic <- taxa_names(prune_taxa(taxa_sums(Bac_morC_Lic) > 0, Bac_morC_Lic))
+# 
+# venn <- venn.diagram(
+#   x = list(BS = otus_BS, Moss = otus_Moss, Soil_Crust = otus_SC, Plants = otus_Pla, Lichen = otus_Lic),
+#   category.names = c("Bulk Soil", "Moss", "Soil Crust", "Plant", "Lichen"),
+#   filename = "VennDiagram_16S_C_order.png",
+#   output = TRUE,
+#     main = "Venn Diagram of Bacterial Orders on the Third Moraines",  # Add title here
+#   main.cex = 1  # Adjust title size (optional)
+# )
+# 
+
+```
+
+## Lichens
+
+
+```{r, echo=FALSE}
+La_Gla_lic_ITS <- La_Gla_ITS_genus_renamed %>%
+  ps_filter(Sample.Type == "Lichen", .keep_all_taxa = FALSE) 
+
+La_Gla_lic_16S <- La_Gla_16S_genus_renamed %>%
+  ps_filter(Sample.Type == "Lichen", .keep_all_taxa = FALSE) 
+  
+La_Gla_lic_ITS %>%
+  comp_barplot("Family", n_taxa = 15, merge_other = FALSE, label = "Sample.Name") +
+  facet_wrap(vars(Moraine), scales = "free") + # scales = "free" is IMPORTANT!
+  coord_flip() +
+  ggtitle(
+    "Fungal Composition of Lichen Samples",
+    "Separated by moraine"
+  ) +
+  theme(axis.ticks.y = element_blank(), strip.text = element_text(face = "bold"))
+
+plot_richness(La_Gla_lic_ITS, x="Moraine", color = "Species", measures=c("Chao1", "Shannon"))
+
+La_Gla_lic_16S %>%
+  comp_barplot("Phylum", n_taxa = 15, merge_other = FALSE, label = "Sample.Name") +
+  facet_wrap(vars(Moraine), scales = "free") + # scales = "free" is IMPORTANT!
+  coord_flip() +
+  ggtitle(
+    "Bacterial Composition of Lichen Samples",
+    "Separated by moraine"
+  ) +
+  theme(axis.ticks.y = element_blank(), strip.text = element_text(face = "bold"))
+
+plot_richness(La_Gla_lic_16S, x="Moraine", color = "Species", measures=c("Chao1", "Shannon"))
+
+#ord_explore(La_Gla_lic_16S)
+
+La_Gla_lic_16S %>%
+ tax_transform(rank = "Phylum", trans = "clr") %>%
+ # dist_calc(dist = "euclidean") %>%
+ ord_calc(
+  method = "auto"
+ ) %>% 
+ ord_plot(
+  axes = c(1, 2),
+  colour = "Location", fill = "Location",
+  shape = "Moraine", alpha = 0.5,
+  size = 3,
+  plot_taxa = 1:5,
+  )+
+ scale_shape_girafe_filled()+
+  ggtitle(
+    "PCA of Bacterial Phyla from Lichens",
+  )
+
+
+#ord_explore(La_Gla_lic_ITS)
+
+La_Gla_lic_ITS %>%
+ tax_transform(rank = "Phylum", trans = "clr") %>%
+ # dist_calc(dist = "euclidean") %>%
+ ord_calc(
+  method = "auto"
+ ) %>% 
+ ord_plot(
+  axes = c(1, 2),
+  colour = "Location", fill = "Location",
+  shape = "Moraine", alpha = 0.5,
+  size = 3,
+  plot_taxa = 1:5,
+  )+
+ scale_shape_girafe_filled()+
+  ggtitle(
+    "PCA of Fungal Phyla from Lichens",
+  )  
+
+#Extract OTU table
+
+#remova all taxa with zero reads
+La_Gla_lic_ITS_pseudo <- prune_taxa(taxa_sums(La_Gla_lic_ITS) > 0, La_Gla_lic_ITS)
+
+otu_table(La_Gla_lic_ITS_pseudo) <- otu_table(La_Gla_lic_ITS_pseudo) + + 1e-6
+
+La_Gla_lic_16S_pseudo <- prune_taxa(taxa_sums(La_Gla_lic_16S) > 0, La_Gla_lic_16S) 
+
+otu_table(La_Gla_lic_16S_pseudo) <- otu_table(La_Gla_lic_16S_pseudo) + + 1e-6
+
+
+
+Fun_otu_pseudo <- as.matrix(otu_table(La_Gla_lic_ITS_pseudo)) 
+Fun_otu_pseudo <- as.data.frame(Fun_otu_pseudo)
+
+Bac_otu_pseudo <- as.matrix(otu_table(La_Gla_lic_16S_pseudo)) 
+Bac_otu_pseudo <- as.data.frame(Bac_otu_pseudo)
+
+#CLR transformation
+Fun_otu_clr <- Fun_otu_pseudo %>%
+  microbiome::transform("clr")
+Fun_otu_clr <- as.data.frame(Fun_otu_clr)
+
+Bac_otu_clr <- Bac_otu_pseudo %>%
+  microbiome::transform("clr")
+Bac_otu_clr <- as.data.frame(Bac_otu_clr)
+
+class(Fun_otu_clr)
+class(Bac_otu_clr)
+
+fun_meta <- as.matrix(sample_data(La_Gla_lic_ITS_pseudo))
+fun_meta <- as.data.frame(fun_meta)
+
+Bac_meta <- as.matrix(sample_data(La_Gla_lic_16S_pseudo))
+Bac_meta <- as.data.frame(Bac_meta)
+
+class(fun_meta)
+
+#convert to numeric and factor
+fun_meta$Moraine <- as.factor(fun_meta$Moraine)
+fun_meta$Location <- as.factor(fun_meta$Location)
+fun_meta$Plot <- as.factor(fun_meta$Plot)
+
+Bac_meta$Moraine <- as.factor(Bac_meta$Moraine)
+Bac_meta$Location <- as.factor(Bac_meta$Location)
+Bac_meta$Plot <- as.factor(Bac_meta$Plot)
+
+result <- adonis2(Fun_otu_clr ~  Moraine * Location + Plot, data = fun_meta, method="euclidean",  ,perm=999)
+print(result)
+
+result <- adonis2(Bac_otu_clr ~  Moraine * Location + Plot, data = Bac_meta, method="euclidean" ,perm=999)
+print(result)
+
+
+```
+
+## Mosses
+
+```{r, echo=FALSE}
+La_Gla_moss_ITS <- La_Gla_ITS_genus_renamed %>%
+  ps_filter(Sample.Type == "Moss", .keep_all_taxa = FALSE) 
+
+La_Gla_moss_16S <- La_Gla_16S_genus_renamed %>%
+  ps_filter(Sample.Type == "Moss", .keep_all_taxa = FALSE) 
+  
+La_Gla_moss_ITS %>%
+  comp_barplot("Family", n_taxa = 15, merge_other = FALSE, label = "Sample.Name") +
+  facet_wrap(vars(Moraine), scales = "free") + # scales = "free" is IMPORTANT!
+  coord_flip() +
+  ggtitle(
+    "Fungal Composition of Moss Samples",
+    "Separated by moraine"
+  ) +
+  theme(axis.ticks.y = element_blank(), strip.text = element_text(face = "bold"))
+
+plot_richness(La_Gla_moss_ITS, x="Moraine", color = "Species", measures=c("Chao1", "Shannon"))
+
+La_Gla_moss_16S %>%
+  comp_barplot("Phylum", n_taxa = 15, merge_other = FALSE, label = "Sample.Name") +
+  facet_wrap(vars(Moraine), scales = "free") + # scales = "free" is IMPORTANT!
+  coord_flip() +
+  ggtitle(
+    "Bacterial Composition of Moss Samples",
+    "Separated by moraine"
+  ) +
+  theme(axis.ticks.y = element_blank(), strip.text = element_text(face = "bold"))
+
+plot_richness(La_Gla_moss_16S, x="Moraine", color = "Species", measures=c("Chao1", "Shannon"))
+
+#ord_explore(La_Gla_moss_16S)
+
+La_Gla_moss_16S %>%
+ tax_transform(rank = "Phylum", trans = "clr") %>%
+ # dist_calc(dist = "euclidean") %>%
+ ord_calc(
+  method = "auto"
+ ) %>% 
+ ord_plot(
+  axes = c(1, 2),
+  colour = "Location", fill = "Location",
+  shape = "Moraine", alpha = 0.5,
+  size = 3,
+  plot_taxa = 1:5,
+  )+
+ scale_shape_girafe_filled()+
+  ggtitle(
+    "PCA of Bacterial Phyla from Moss Samples",
+  )
+
+
+#ord_explore(La_Gla_moss_ITS)
+
+La_Gla_moss_ITS %>%
+ tax_transform(rank = "Phylum", trans = "clr") %>%
+ # dist_calc(dist = "euclidean") %>%
+ ord_calc(
+  method = "auto"
+ ) %>% 
+ ord_plot(
+  axes = c(1, 2),
+  colour = "Location", fill = "Location",
+  shape = "Moraine", alpha = 0.5,
+  size = 3,
+  plot_taxa = 1:5,
+  )+
+ scale_shape_girafe_filled()+
+  ggtitle(
+    "PCA of Fungal Phyla from Moss Samples",
+  )
+
+
+#remova all taxa with zero reads
+La_Gla_moss_ITS_pseudo <- prune_taxa(taxa_sums(La_Gla_moss_ITS) > 0, La_Gla_moss_ITS)
+
+otu_table(La_Gla_moss_ITS_pseudo) <- otu_table(La_Gla_moss_ITS_pseudo) + + 1e-6
+
+La_Gla_moss_16S_pseudo <- prune_taxa(taxa_sums(La_Gla_moss_16S) > 0, La_Gla_moss_16S) 
+
+otu_table(La_Gla_moss_16S_pseudo) <- otu_table(La_Gla_moss_16S_pseudo) + + 1e-6
+
+
+
+Fun_otu_pseudo <- as.matrix(otu_table(La_Gla_moss_ITS_pseudo)) 
+Fun_otu_pseudo <- as.data.frame(Fun_otu_pseudo)
+
+Bac_otu_pseudo <- as.matrix(otu_table(La_Gla_moss_16S_pseudo)) 
+Bac_otu_pseudo <- as.data.frame(Bac_otu_pseudo)
+
+#CLR transformation
+Fun_otu_clr <- Fun_otu_pseudo %>%
+  microbiome::transform("clr")
+Fun_otu_clr <- as.data.frame(Fun_otu_clr)
+
+Bac_otu_clr <- Bac_otu_pseudo %>%
+  microbiome::transform("clr")
+Bac_otu_clr <- as.data.frame(Bac_otu_clr)
+
+class(Fun_otu_clr)
+class(Bac_otu_clr)
+
+fun_meta <- as.matrix(sample_data(La_Gla_moss_ITS_pseudo))
+fun_meta <- as.data.frame(fun_meta)
+
+Bac_meta <- as.matrix(sample_data(La_Gla_moss_16S_pseudo))
+Bac_meta <- as.data.frame(Bac_meta)
+
+class(fun_meta)
+
+#convert to numeric and factor
+fun_meta$Moraine <- as.factor(fun_meta$Moraine)
+fun_meta$Location <- as.factor(fun_meta$Location)
+fun_meta$Plot <- as.factor(fun_meta$Plot)
+
+Bac_meta$Moraine <- as.factor(Bac_meta$Moraine)
+Bac_meta$Location <- as.factor(Bac_meta$Location)
+Bac_meta$Plot <- as.factor(Bac_meta$Plot)
+
+result <- adonis2(Fun_otu_clr ~  Moraine * Location + Plot, data = fun_meta, method="euclidean", perm=999)
+print(result)
+
+result <- adonis2(Bac_otu_clr ~  Moraine * Location + Plot, data = Bac_meta, method="euclidean",,perm=999)
+print(result)
+
+
+```
+
+
+## Plants
+
+```{r, echo=FALSE}
+
+La_Gla_pla_ITS <- La_Gla_ITS_genus_renamed %>%
+  ps_filter(Sample.Type == "Plant", .keep_all_taxa = FALSE) 
+
+La_Gla_pla_16S <- La_Gla_16S_genus_renamed %>%
+  ps_filter(Sample.Type == "Plant", .keep_all_taxa = FALSE) 
+  
+La_Gla_pla_ITS %>%
+  comp_barplot("Family", n_taxa = 15, merge_other = FALSE, label = "Sample.Name") +
+  facet_wrap(vars(Moraine), scales = "free") + # scales = "free" is IMPORTANT!
+  coord_flip() +
+  ggtitle(
+    "Fungal Composition of Plant Samples",
+    "Separated by moraine"
+  ) +
+  theme(axis.ticks.y = element_blank(), strip.text = element_text(face = "bold"))
+
+plot_richness(La_Gla_pla_ITS, x="Moraine", color = "Species", measures=c("Chao1", "Shannon"))
+
+La_Gla_pla_16S %>%
+  comp_barplot("Phylum", n_taxa = 15, merge_other = FALSE, label = "Sample.Name") +
+  facet_wrap(vars(Moraine), scales = "free") + #scales = "free" is IMPORTANT!
+  coord_flip() +
+  ggtitle(
+    "Bacterial Composition of plant Samples",
+    "Separated by moraine"
+  ) +
+  theme(axis.ticks.y = element_blank(), strip.text = element_text(face = "bold"))
+
+plot_richness(La_Gla_pla_16S, x="Moraine", color = "Species", measures=c("Chao1", "Shannon"))
+
+#ord_explore(La_Gla_pla_16S)
+
+La_Gla_pla_16S %>%
+ tax_transform(rank = "Phylum", trans = "clr") %>%
+ # dist_calc(dist = "euclidean") %>%
+ ord_calc(
+  method = "auto"
+ ) %>% 
+ ord_plot(
+  axes = c(1, 2),
+  colour = "Location", fill = "Location",
+  shape = "Moraine", alpha = 0.5,
+  size = 3,
+  plot_taxa = 1:5,
+  )+
+ scale_shape_girafe_filled()+
+  ggtitle(
+    "PCA of Bacterial Phyla from Plant Samples",
+  )
+
+
+#ord_explore(La_Gla_pla_ITS)
+
+La_Gla_pla_ITS %>%
+ tax_transform(rank = "Phylum", trans = "clr") %>%
+ # dist_calc(dist = "euclidean") %>%
+ ord_calc(
+  method = "auto"
+ ) %>% 
+ ord_plot(
+  axes = c(1, 2),
+  colour = "Location", fill = "Location",
+  shape = "Moraine", alpha = 0.5,
+  size = 3,
+  plot_taxa = 1:5,
+  )+
+ scale_shape_girafe_filled()+
+  ggtitle(
+    "PCA of Fungal Phyla from Plant Samples",
+  )
+
+
+
+#remova all taxa with zero reads
+La_Gla_pla_ITS_pseudo <- prune_taxa(taxa_sums(La_Gla_pla_ITS) > 0, La_Gla_pla_ITS)
+
+otu_table(La_Gla_pla_ITS_pseudo) <- otu_table(La_Gla_pla_ITS_pseudo) + + 1e-6
+
+La_Gla_pla_16S_pseudo <- prune_taxa(taxa_sums(La_Gla_pla_16S) > 0, La_Gla_pla_16S) 
+
+otu_table(La_Gla_pla_16S_pseudo) <- otu_table(La_Gla_pla_16S_pseudo) + + 1e-6
+
+
+
+Fun_otu_pseudo <- as.matrix(otu_table(La_Gla_pla_ITS_pseudo)) 
+Fun_otu_pseudo <- as.data.frame(Fun_otu_pseudo)
+
+Bac_otu_pseudo <- as.matrix(otu_table(La_Gla_pla_16S_pseudo)) 
+Bac_otu_pseudo <- as.data.frame(Bac_otu_pseudo)
+
+#CLR transformation
+Fun_otu_clr <- Fun_otu_pseudo %>%
+  microbiome::transform("clr")
+Fun_otu_clr <- as.data.frame(Fun_otu_clr)
+
+Bac_otu_clr <- Bac_otu_pseudo %>%
+  microbiome::transform("clr")
+Bac_otu_clr <- as.data.frame(Bac_otu_clr)
+
+class(Fun_otu_clr)
+class(Bac_otu_clr)
+
+fun_meta <- as.matrix(sample_data(La_Gla_pla_ITS_pseudo))
+fun_meta <- as.data.frame(fun_meta)
+
+Bac_meta <- as.matrix(sample_data(La_Gla_pla_16S_pseudo))
+Bac_meta <- as.data.frame(Bac_meta)
+
+class(fun_meta)
+
+#convert to numeric and factor
+fun_meta$Moraine <- as.factor(fun_meta$Moraine)
+fun_meta$Location <- as.factor(fun_meta$Location)
+fun_meta$Plot <- as.factor(fun_meta$Plot)
+
+Bac_meta$Moraine <- as.factor(Bac_meta$Moraine)
+Bac_meta$Location <- as.factor(Bac_meta$Location)
+Bac_meta$Plot <- as.factor(Bac_meta$Plot)
+
+result <- adonis2(Fun_otu_clr ~  Moraine * Location + Plot, data = fun_meta, method="euclidean" ,perm=999)
+print(result)
+
+result <- adonis2(Bac_otu_clr ~  Moraine * Location + Plot, data = Bac_meta, method="euclidean" ,perm=999)
+print(result)
+
+
+
+
+```
+
+
+
+
+## Soil Crust
+
+```{r, echo=FALSE}
+
+La_Gla_SC_ITS <- La_Gla_ITS_genus_renamed %>%
+  ps_filter(Sample.Type == "Soil Crust", .keep_all_taxa = FALSE) 
+
+La_Gla_SC_16S <- La_Gla_16S_genus_renamed %>%
+  ps_filter(Sample.Type == "Soil Crust", .keep_all_taxa = FALSE) 
+  
+La_Gla_SC_ITS %>%
+  comp_barplot("Family", n_taxa = 15, merge_other = FALSE, label = "Sample.Name") +
+  facet_wrap(vars(Moraine), scales = "free") + # scales = "free" is IMPORTANT!
+  coord_flip() +
+  ggtitle(
+    "Fungal Composition of Soil Crust Samples",
+    "Separated by moraine"
+  ) +
+  theme(axis.ticks.y = element_blank(), strip.text = element_text(face = "bold"))
+
+plot_richness(La_Gla_SC_ITS, x="Moraine", color = "Species", measures=c("Chao1", "Shannon"))
+
+La_Gla_SC_16S %>%
+  comp_barplot("Phylum", n_taxa = 15, merge_other = FALSE, label = "Sample.Name") +
+  facet_wrap(vars(Moraine), scales = "free") + # scales = "free" is IMPORTANT!
+  coord_flip() +
+  ggtitle(
+    "Bacterial Composition of Soil Crust Samples",
+    "Separated by moraine"
+  ) +
+  theme(axis.ticks.y = element_blank(), strip.text = element_text(face = "bold"))
+
+plot_richness(La_Gla_SC_16S, x="Moraine", color = "Species", measures=c("Chao1", "Shannon"))
+
+#ord_explore(La_Gla_SC_16S)
+
+La_Gla_SC_16S %>%
+ tax_transform(rank = "Phylum", trans = "clr") %>%
+ # dist_calc(dist = "euclidean") %>%
+ ord_calc(
+  method = "auto"
+ ) %>% 
+ ord_plot(
+  axes = c(1, 2),
+  colour = "Location", fill = "Location",
+  shape = "Moraine", alpha = 0.5,
+  size = 3,
+  plot_taxa = 1:5,
+  )+
+ scale_shape_girafe_filled()+
+  ggtitle(
+    "PCA of Bacterial Phyla from Soil Crust",
+  )
+
+
+#ord_explore(La_Gla_SC_ITS)
+
+La_Gla_SC_ITS %>%
+ tax_transform(rank = "Phylum", trans = "clr") %>%
+ # dist_calc(dist = "euclidean") %>%
+ ord_calc(
+  method = "auto"
+ ) %>% 
+ ord_plot(
+  axes = c(1, 2),
+  colour = "Location", fill = "Location",
+  shape = "Moraine", alpha = 0.5,
+  size = 3,
+  plot_taxa = 1:5,
+  )+
+ scale_shape_girafe_filled()+
+  ggtitle(
+    "PCA of Fungal Phyla from Soil Crust",
+  )
+
+
+
+
+#remova all taxa with zero reads
+La_Gla_SC_ITS_pseudo <- prune_taxa(taxa_sums(La_Gla_SC_ITS) > 0, La_Gla_SC_ITS)
+
+otu_table(La_Gla_SC_ITS_pseudo) <- otu_table(La_Gla_SC_ITS_pseudo) + + 1e-6
+
+La_Gla_SC_16S_pseudo <- prune_taxa(taxa_sums(La_Gla_SC_16S) > 0, La_Gla_SC_16S) 
+
+otu_table(La_Gla_SC_16S_pseudo) <- otu_table(La_Gla_SC_16S_pseudo) + + 1e-6
+
+
+
+Fun_otu_pseudo <- as.matrix(otu_table(La_Gla_SC_ITS_pseudo)) 
+Fun_otu_pseudo <- as.data.frame(Fun_otu_pseudo)
+
+Bac_otu_pseudo <- as.matrix(otu_table(La_Gla_SC_16S_pseudo)) 
+Bac_otu_pseudo <- as.data.frame(Bac_otu_pseudo)
+
+#CLR transformation
+Fun_otu_clr <- Fun_otu_pseudo %>%
+  microbiome::transform("clr")
+Fun_otu_clr <- as.data.frame(Fun_otu_clr)
+
+Bac_otu_clr <- Bac_otu_pseudo %>%
+  microbiome::transform("clr")
+Bac_otu_clr <- as.data.frame(Bac_otu_clr)
+
+class(Fun_otu_clr)
+class(Bac_otu_clr)
+
+fun_meta <- as.matrix(sample_data(La_Gla_SC_ITS_pseudo))
+fun_meta <- as.data.frame(fun_meta)
+
+Bac_meta <- as.matrix(sample_data(La_Gla_SC_16S_pseudo))
+Bac_meta <- as.data.frame(Bac_meta)
+
+class(fun_meta)
+
+#convert to numeric and factor
+fun_meta$Moraine <- as.factor(fun_meta$Moraine)
+fun_meta$Location <- as.factor(fun_meta$Location)
+fun_meta$Plot <- as.factor(fun_meta$Plot)
+
+Bac_meta$Moraine <- as.factor(Bac_meta$Moraine)
+Bac_meta$Location <- as.factor(Bac_meta$Location)
+Bac_meta$Plot <- as.factor(Bac_meta$Plot)
+
+result <- adonis2(Fun_otu_clr ~  Moraine + Location, data = fun_meta, method="euclidean" ,perm=999)
+print(result)
+
+result <- adonis2(Bac_otu_clr ~  Moraine + Location, data = Bac_meta, method="euclidean" ,perm=999)
+print(result)
+
+
+
+#remova all taxa with zero reads
+La_Gla_SC_ITS_pseudo <- prune_taxa(taxa_sums(La_Gla_SC_ITS) > 0, La_Gla_SC_ITS)
+
+otu_table(La_Gla_SC_ITS_pseudo) <- otu_table(La_Gla_SC_ITS_pseudo) + + 1e-6
+
+La_Gla_SC_16S_pseudo <- prune_taxa(taxa_sums(La_Gla_SC_16S) > 0, La_Gla_SC_16S) 
+
+otu_table(La_Gla_SC_16S_pseudo) <- otu_table(La_Gla_SC_16S_pseudo) + + 1e-6
+
+
+
+Fun_otu_pseudo <- as.matrix(otu_table(La_Gla_SC_ITS_pseudo)) 
+Fun_otu_pseudo <- as.data.frame(Fun_otu_pseudo)
+
+Bac_otu_pseudo <- as.matrix(otu_table(La_Gla_SC_16S_pseudo)) 
+Bac_otu_pseudo <- as.data.frame(Bac_otu_pseudo)
+
+#CLR transformation
+Fun_otu_clr <- Fun_otu_pseudo %>%
+  microbiome::transform("clr")
+Fun_otu_clr <- as.data.frame(Fun_otu_clr)
+
+Bac_otu_clr <- Bac_otu_pseudo %>%
+  microbiome::transform("clr")
+Bac_otu_clr <- as.data.frame(Bac_otu_clr)
+
+class(Fun_otu_clr)
+class(Bac_otu_clr)
+
+fun_meta <- as.matrix(sample_data(La_Gla_SC_ITS_pseudo))
+fun_meta <- as.data.frame(fun_meta)
+
+Bac_meta <- as.matrix(sample_data(La_Gla_SC_16S_pseudo))
+Bac_meta <- as.data.frame(Bac_meta)
+
+class(fun_meta)
+
+#convert to numeric and factor
+fun_meta$Moraine <- as.factor(fun_meta$Moraine)
+fun_meta$Location <- as.factor(fun_meta$Location)
+fun_meta$Plot <- as.factor(fun_meta$Plot)
+
+Bac_meta$Moraine <- as.factor(Bac_meta$Moraine)
+Bac_meta$Location <- as.factor(Bac_meta$Location)
+Bac_meta$Plot <- as.factor(Bac_meta$Plot)
+
+result <- adonis2(Fun_otu_clr ~  Moraine * Location, data = fun_meta, method="euclidean" ,perm=999)
+print(result)
+
+result <- adonis2(Bac_otu_clr ~  Moraine * Location, data = Bac_meta, method="euclidean" ,perm=999)
+print(result)
+
+
+
+```
+
+##  Bulk Soil
+
+```{r, echo=FALSE}
+
+La_Gla_BS_ITS <- La_Gla_ITS_genus_renamed %>%
+  ps_filter(Sample.Type == "Bulk Soil", .keep_all_taxa = FALSE) 
+
+La_Gla_BS_16S <- La_Gla_16S_genus_renamed %>%
+  ps_filter(Sample.Type == "Bulk Soil", .keep_all_taxa = FALSE) 
+  
+La_Gla_BS_ITS %>%
+  comp_barplot("Family", n_taxa = 15, merge_other = FALSE, label = "Sample.Name") +
+  facet_wrap(vars(Moraine), scales = "free") + # scales = "free" is IMPORTANT!
+  coord_flip() +
+  ggtitle(
+    "Fungal Composition of Bulk Soil Samples",
+    "Separated by moraine"
+  ) +
+  theme(axis.ticks.y = element_blank(), strip.text = element_text(face = "bold"))
+
+plot_richness(La_Gla_BS_ITS, x="Moraine", color = "Species", measures=c("Chao1", "Shannon"))
+
+La_Gla_BS_16S %>%
+  comp_barplot("Phylum", n_taxa = 15, merge_other = FALSE, label = "Sample.Name") +
+  facet_wrap(vars(Moraine), scales = "free") + # scales = "free" is IMPORTANT!
+  coord_flip() +
+  ggtitle(
+    "Bacterial Composition of Bulk Soil Samples",
+    "Separated by moraine"
+  ) +
+  theme(axis.ticks.y = element_blank(), strip.text = element_text(face = "bold"))
+
+plot_richness(La_Gla_BS_16S, x="Moraine", color = "Species", measures=c("Chao1", "Shannon"))
+
+
+#ord_explore(La_Gla_BS_16S)
+
+La_Gla_BS_16S %>%
+ tax_transform(rank = "Phylum", trans = "clr") %>%
+ # dist_calc(dist = "euclidean") %>%
+ ord_calc(
+  method = "auto"
+ ) %>% 
+ ord_plot(
+  axes = c(1, 2),
+  colour = "Location", fill = "Location",
+  shape = "Moraine", alpha = 0.5,
+  size = 2,
+  plot_taxa = 1:7
+ ) + 
+ scale_shape_girafe_filled()+
+  ggtitle(
+    "PCoA of Bacterial Phyla from Bulk Soil",
+  )
+
+
+#ord_explore(La_Gla_BS_ITS)
+
+La_Gla_BS_ITS %>%
+ tax_transform(rank = "Phylum", trans = "clr") %>%
+ # dist_calc(dist = "euclidean") %>%
+ ord_calc(
+  method = "auto"
+ ) %>% 
+ ord_plot(
+  axes = c(1, 2),
+  colour = "Location", fill = "Location",
+  shape = "Moraine", alpha = 0.5,
+  size = 3,
+  plot_taxa = 1:5,
+  )+
+ scale_shape_girafe_filled()+
+  ggtitle(
+    "PCA of Fungal Phyla from Bulk Soil",
+  )
+
+
+#remova all taxa with zero reads
+La_Gla_BS_ITS_pseudo <- prune_taxa(taxa_sums(La_Gla_BS_ITS) > 0, La_Gla_BS_ITS)
+
+otu_table(La_Gla_BS_ITS_pseudo) <- otu_table(La_Gla_BS_ITS_pseudo) + + 1e-6
+
+La_Gla_BS_16S_pseudo <- prune_taxa(taxa_sums(La_Gla_BS_16S) > 0, La_Gla_BS_16S) 
+
+otu_table(La_Gla_BS_16S_pseudo) <- otu_table(La_Gla_BS_16S_pseudo) + + 1e-6
+
+
+
+Fun_otu_pseudo <- as.matrix(otu_table(La_Gla_BS_ITS_pseudo)) 
+Fun_otu_pseudo <- as.data.frame(Fun_otu_pseudo)
+
+Bac_otu_pseudo <- as.matrix(otu_table(La_Gla_BS_16S_pseudo)) 
+Bac_otu_pseudo <- as.data.frame(Bac_otu_pseudo)
+
+#CLR transformation
+Fun_otu_clr <- Fun_otu_pseudo %>%
+  microbiome::transform("clr")
+Fun_otu_clr <- as.data.frame(Fun_otu_clr)
+
+Bac_otu_clr <- Bac_otu_pseudo %>%
+  microbiome::transform("clr")
+Bac_otu_clr <- as.data.frame(Bac_otu_clr)
+
+class(Fun_otu_clr)
+class(Bac_otu_clr)
+
+fun_meta <- as.matrix(sample_data(La_Gla_BS_ITS_pseudo))
+fun_meta <- as.data.frame(fun_meta)
+
+Bac_meta <- as.matrix(sample_data(La_Gla_BS_16S_pseudo))
+Bac_meta <- as.data.frame(Bac_meta)
+
+class(fun_meta)
+
+#convert to numeric and factor
+fun_meta$Moraine <- as.factor(fun_meta$Moraine)
+fun_meta$Location <- as.factor(fun_meta$Location)
+fun_meta$Plot <- as.factor(fun_meta$Plot)
+
+Bac_meta$Moraine <- as.factor(Bac_meta$Moraine)
+Bac_meta$Location <- as.factor(Bac_meta$Location)
+Bac_meta$Plot <- as.factor(Bac_meta$Plot)
+
+result <- adonis2(Fun_otu_clr ~  Moraine + Location, data = fun_meta, method="euclidean" ,perm=999)
+print(result)
+
+result <- adonis2(Bac_otu_clr ~  Moraine + Location, data = Bac_meta, method="euclidean" ,perm=999)
+print(result)
+
+
+
+
+
+
+```
+
+```{r, network analysis results, echo=FALSE}
+# 
+# setwd("~/PhD/Proj/Ladakh_2022/Glacier Transects/Molecular")
+# NetPar_16S <- read_csv("La_Gla_Net_Summary_16S_Parameters.csv")
+# 
+# NetPar_16S <- subset(NetPar_16S, Num_Samples > 2)
+# 
+# summary(NetPar_16S)
+# colnames(NetPar_16S)
+# 
+# cols_to_scale <- c("avDiss1",    "avPath1", "clustCoef1", "modularity1",  "vertConnect1", "edgeConnect1", "natConnect1",  "density1",  "pep1") 
+# 
+# NetPar_16S_scale <- as.data.frame(NetPar_16S %>%
+#   mutate(across(all_of(cols_to_scale), scale)))
+# 
+# summary(NetPar_16S_scale)
+# 
+# hist(NetPar_16S$avDiss1)
+# hist(NetPar_16S_scale$avDiss1)
+# 
+# hist(NetPar_16S$avPath1)
+# hist(NetPar_16S_scale$avPath1)
+# 
+# hist(NetPar_16S$clustCoef1)
+# hist(NetPar_16S_scale$clustCoef1)
+# 
+# hist(NetPar_16S$modularity1)
+# hist(NetPar_16S_scale$modularity1)
+# 
+# hist(NetPar_16S$vertConnect1)
+# hist(NetPar_16S_scale$vertConnect1)
+# 
+# hist(NetPar_16S$edgeConnect1)
+# hist(NetPar_16S_scale$edgeConnect1)
+# 
+# hist(NetPar_16S$natConnect1)
+# hist(NetPar_16S_scale$natConnect1)
+# 
+# hist(NetPar_16S$density1)
+# hist(NetPar_16S_scale$density1)
+# 
+# hist(NetPar_16S$pep1)
+# hist(NetPar_16S_scale$pep1)
+# 
+# meta <- as.data.frame(as.matrix(meta))
+# class(meta)
+# merged <- merge(meta,NetPar_16S_scale, by = "Plot")
+# 
+
+
+
+```
+
+
+```{r, rda}
+
+```
+##RDA with soil as explanatory variables
+```{r, echo= FALSE}
+# 
+# Arizona_clean_16S_rare_forsoil_RDA <- Arizona_clean_16S_rare %>%
+#   ps_filter(!is.na(pH), .keep_all_taxa = TRUE)
+#  
+# 
+# 
+# # Agglomerate at Genus level (example)
+# Arizona_clean_16S_rare_genus <- Arizona_clean_16S_rare_forsoil_RDA %>%
+#   tax_transform(rank = "Genus", trans = "hellinger")
+# 
+# #tax_fix_interactive(Arizona_clean_16S_rare_genus)
+# 
+# # Agglomerate at Phylum level (example)
+# Arizona_clean_16S_rare_phylum <- Arizona_clean_16S_rare_forsoil_RDA %>%
+#   tax_transform(rank = "Phylum", trans = "hellinger")
+# 
+# # Convert OTU table to matrix
+# otu_table_matrix_phylum <- as(otu_table(Arizona_clean_16S_rare_phylum), "matrix")  # Change to Ps_obj_genus if needed
+# Phylum_hell <- as.data.frame(decostand (otu_table_matrix_phylum, 'hell'))
+# 
+# # Convert sample metadata to a data frame
+# metadata_df <- as.data.frame((sample_data(Arizona_clean_16S_rare_phylum)))
+# 
+# # Ensure sample names match
+# metadata_df <- metadata_df[rownames(metadata_df) %in% rownames(otu_table_matrix_phylum), ]
+# 
+# # Select relevant environmental variables
+# metadata_selected <- as.data.frame(metadata_df[, c("pH" ,                  "DW_g_g" ,              "OM_g_g" ,              "course_fraction_perc",
+#  "log_N.NH4_m_g",        "log_P_PO4_g_g" ,       "log_TN_g_g"  ,         "log_TP_g_g" ,          "log_Mg_mg_g",          "log_K_mg_g" ,         
+#  "log_Ca_mg_g")])  # Modify based on dataset
+# 
+# 
+# metadata_scale <- as.data.frame(scale(metadata_selected))
+# 
+# 
+# rda_result_phylum <- rda(Phylum_hell ~ ., data = metadata_scale[c("pH", "DW_g_g", "OM_g_g", 
+#                                            "course_fraction_perc", "log_N.NH4_m_g", 
+#                                            "log_P_PO4_g_g", "log_TN_g_g", "log_TP_g_g", 
+#                                            "log_Mg_mg_g", "log_K_mg_g", "log_Ca_mg_g")])
+# 
+# # View summary
+# #summary(rda_result_phylum)
+# anova(rda_result_phylum)
+# 
+# plot(rda_result_phylum, scaling=2)  # Basic RDA plot
+# 
+# 
+# # Extract RDA site scores (samples)
+# rda_sites <- scores(rda_result_phylum, display="sites")
+# rda_sites_df <- as.data.frame(rda_sites)
+# rda_sites_df$Sample <- rownames(rda_sites_df)
+# 
+# # Extract RDA explanatory variable scores (arrows)
+# rda_env <- scores(rda_result_phylum, display="bp")  # "bp" for biplot scores
+# rda_env_df <- as.data.frame(rda_env)
+# rda_env_df$Variable <- rownames(rda_env_df)
+# 
+# # Merge site scores with metadata
+# rda_sites_df <- merge(rda_sites_df, metadata_scale, by.x="Sample", by.y="row.names")
+# 
+# # Plot with explanatory variable arrows
+# ggplot() +
+#   # Plot RDA samples
+#   geom_point(data=rda_sites_df, aes(x=RDA1, y=RDA2, color = metadata_df$Latitude), size=3) +
+#   
+#   # Add arrows for explanatory variables
+#   geom_segment(data=rda_env_df, aes(x=0, y=0, xend=RDA1, yend=RDA2),
+#                arrow=arrow(length=unit(0.3, "cm")), color="black") +
+#   
+#   # Add text labels for explanatory variables
+#   geom_text(data=rda_env_df, aes(x=RDA1, y=RDA2, label=Variable), 
+#             hjust=0.5, vjust=-0.5, size=3, color="black") +
+# 
+#   theme_minimal() +
+#   labs(title="RDA Ordination of Bacterial Genera with Soil Chemistry as Explanatory Variables", 
+#        x="RDA1", y="RDA2")
+# 
+# 
+# 
+# print("OVERALL TEST OF RDA OF BACTERIAL PHYLA AND SOIL CHEMISTY")
+# anova(rda_result_phylum, permutations=999)  # Overall test
+# print("TESTING OF INDIVIDUAL SOIL VARIABLES ")
+# anova(rda_result_phylum, by="terms", permutations=999)  # Test individual variables
+# 
+# #####GENUS NOW
+# # Convert OTU table to matrix
+# otu_table_matrix_genus <- as(otu_table(Arizona_clean_16S_rare_genus), "matrix")  # Change to Ps_obj_genus if needed
+# genus_hell <- as.data.frame(decostand (otu_table_matrix_genus, 'hell'))
+# 
+# # Convert sample metadata to a data frame
+# metadata_df <- as.data.frame((sample_data(Arizona_clean_16S_rare_genus)))
+# 
+# # Ensure sample names match
+# metadata_df <- metadata_df[rownames(metadata_df) %in% rownames(otu_table_matrix_genus), ]
+# 
+# # Select relevant environmental variables
+# metadata_selected <- as.data.frame(metadata_df[, c("pH" ,                  "DW_g_g" ,              "OM_g_g" ,              "course_fraction_perc",
+#  "log_N.NH4_m_g",        "log_P_PO4_g_g" ,       "log_TN_g_g"  ,         "log_TP_g_g" ,          "log_Mg_mg_g",          "log_K_mg_g" ,         
+#  "log_Ca_mg_g")])  # Modify based on dataset
+# 
+# 
+# metadata_scale <- as.data.frame(scale(metadata_selected))
+# 
+# 
+# rda_result_genus <- rda(genus_hell ~ ., data = metadata_scale[c("pH", "DW_g_g", "OM_g_g", 
+#                                            "course_fraction_perc", "log_N.NH4_m_g", 
+#                                            "log_P_PO4_g_g", "log_TN_g_g", "log_TP_g_g", 
+#                                            "log_Mg_mg_g", "log_K_mg_g", "log_Ca_mg_g")])
+# 
+# # View summary
+# #summary(rda_result_genus)
+# anova(rda_result_genus)
+# 
+# plot(rda_result_genus, scaling=2)  # Basic RDA plot
+# 
+# 
+# # Extract RDA site scores (samples)
+# rda_sites <- scores(rda_result_genus, display="sites")
+# rda_sites_df <- as.data.frame(rda_sites)
+# rda_sites_df$Sample <- rownames(rda_sites_df)
+# 
+# # Extract RDA explanatory variable scores (arrows)
+# rda_env <- scores(rda_result_genus, display="bp")  # "bp" for biplot scores
+# rda_env_df <- as.data.frame(rda_env)
+# rda_env_df$Variable <- rownames(rda_env_df)
+# 
+# # Merge site scores with metadata
+# rda_sites_df <- merge(rda_sites_df, metadata_scale, by.x="Sample", by.y="row.names")
+# 
+# # Plot with explanatory variable arrows
+# ggplot() +
+#   # Plot RDA samples
+#   geom_point(data=rda_sites_df, aes(x=RDA1, y=RDA2, color = metadata_df$Latitude), size=3) +
+#   
+#   # Add arrows for explanatory variables
+#   geom_segment(data=rda_env_df, aes(x=0, y=0, xend=RDA1, yend=RDA2),
+#                arrow=arrow(length=unit(0.3, "cm")), color="black") +
+#   
+#   # Add text labels for explanatory variables
+#   geom_text(data=rda_env_df, aes(x=RDA1, y=RDA2, label=Variable), 
+#             hjust=0.5, vjust=-0.5, size=3, color="black") +
+# 
+#   theme_minimal() +
+#   labs(title="RDA Ordination of Bacterial Genera with Soil as Explanatory Variables", 
+#        x="RDA1", y="RDA2")
+# 
+# 
+# 
+# print("OVERALL TEST OF RDA OF BACTERIAL PHYLA AND SOIL CHEMISTY")
+# anova(rda_result_genus, permutations=999)  # Overall test
+# print("TESTING OF INDIVIDUAL SOIL VARIABLES ")
+# anova(rda_result_genus, by="terms", permutations=999)  # Test individual variables
+# 
+
+
+
+
+```

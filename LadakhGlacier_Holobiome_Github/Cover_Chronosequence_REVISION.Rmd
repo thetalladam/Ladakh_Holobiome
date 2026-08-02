@@ -1,0 +1,4062 @@
+---
+title: "Surface cover change across glacier chronosequences — Ladakh 2022"
+author: "Adam Ruka"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+Analyses changes in surface cover types (lichen, moss, soil crust, forb, graminoid,
+bare soil, stones) across the moraine-age chronosequence (A = young → B = intermediate
+→ C = old) at two glacier locations (Nubra, Tsomoriri).
+
+**Input:** `Glacier_Soil_Topo_merged.xlsx` (project root)
+
+**Open `Glacier Transects.Rproj`**, then Knit.
+
+```{r project-setup, message=FALSE, warning=FALSE}
+if (!file.exists("Glacier Transects.Rproj") && file.exists("../Glacier Transects.Rproj")) {
+  setwd("..")
+}
+stopifnot("Open Glacier Transects.Rproj first" = file.exists("Glacier Transects.Rproj"))
+
+project_root  <- normalizePath(getwd(), winslash = "/", mustWork = FALSE)
+molecular_dir <- normalizePath(file.path(project_root, "Molecular"),
+                               winslash = "/", mustWork = FALSE)
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(readxl)
+  library(multcompView)
+  library(knitr)
+  library(kableExtra)
+  library(ggplot2)
+  library(patchwork)
+  library(lavaan)
+  library(piecewiseSEM)
+  library(svglite)
+})
+
+# Illustrator-friendly SVG export (plain text/lines; avoids grDevices filter stacks).
+save_gg_svg <- function(filename, plot, width, height, bg = "white") {
+  ggsave(
+    filename = filename,
+    plot = plot,
+    width = width,
+    height = height,
+    device = svglite,
+    bg = bg
+  )
+}
+
+cat("Project root: ", project_root,  "\n")
+cat("Molecular dir:", molecular_dir, "\n")
+
+# ── Cover variable names (long labels for plotting) ──────────────────────────
+cover_vars <- c(
+  "Total_lichen_cover",
+  "Moss_cover",
+  "Crust_cover",
+  "Forb_cover",
+  "Gaminoid_cover",
+  "Bare_Soil_Total",
+  "Stones"
+)
+
+cover_labels <- c(
+  Total_lichen_cover = "Lichen cover (%)",
+  Moss_cover         = "Moss cover (%)",
+  Crust_cover        = "Soil crust cover (%)",
+  Forb_cover         = "Forb cover (%)",
+  Gaminoid_cover     = "Graminoid cover (%)",
+  Bare_Soil_Total    = "Bare soil (%)",
+  Stones             = "Stone cover (%)"
+)
+
+moraine_labels <- c(A = "Young (A)", B = "Intermediate (B)", C = "Old (C)")
+moraine_colours <- c(
+  A = "#8C510A", # young — brown
+  B = "#A6D96A", # intermediate — light green
+  C = "#1B7837"  # old — dark green
+)
+location_shapes <- c(
+  Nubra = 21,      # circle
+  Tsomoriri = 24   # triangle
+)
+alpha <- 0.05
+```
+
+## Load metadata
+
+```{r load-metadata}
+meta_file <- file.path(project_root, "Glacier_Soil_Topo_merged.xlsx")
+stopifnot("Glacier_Soil_Topo_merged.xlsx not found at project root" = file.exists(meta_file))
+
+plot_meta_raw <- read_excel(meta_file)
+
+cat("Rows:", nrow(plot_meta_raw), "| Columns:", ncol(plot_meta_raw), "\n")
+cat("Column names:\n")
+print(colnames(plot_meta_raw))
+```
+
+## Prepare data
+
+```{r prepare-data}
+derive_glacier_id <- function(plot) {
+  out <- as.character(plot)
+  # Handles IDs such as NUB1-C-1 or Nubra_1_A by dropping moraine/replicate suffixes.
+  out <- sub("[-_][ABC][-_][0-9]+$", "", out)
+  out <- sub("[-_][ABC]$", "", out)
+  out
+}
+
+plot_meta <- plot_meta_raw
+if (!"GlacierID" %in% names(plot_meta)) {
+  plot_meta <- plot_meta %>%
+    mutate(GlacierID = derive_glacier_id(Plot))
+}
+
+plot_meta <- plot_meta %>%
+  mutate(
+    Moraine  = factor(Moraine,  levels = c("A", "B", "C"), labels = c("A", "B", "C")),
+    Moraine_num = as.integer(Moraine),
+    Location = factor(Location, levels = c("Nubra", "Tsomoriri")),
+    GlacierID = factor(GlacierID),
+    # Glacier × moraine random intercept (matches molecular analyses)
+    Glacier_Moraine = factor(Plot),
+    Aspect_sin = sin(Aspect * pi / 180),
+    Aspect_cos = cos(Aspect * pi / 180)
+  ) %>%
+  # Ensure all cover columns are numeric
+  mutate(across(all_of(cover_vars), as.numeric))
+
+# Quick preview
+plot_meta %>%
+  select(Plot, Location, Moraine, all_of(cover_vars)) %>%
+  arrange(Location, Moraine) %>%
+  kable(digits = 1, caption = "Plot metadata — cover variables") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## Descriptive summary
+
+Mean (± SE) cover by moraine age and location.
+
+```{r descriptive-summary}
+cover_long <- plot_meta %>%
+  select(Plot, Location, Moraine, Glacier_Moraine, all_of(cover_vars)) %>%
+  pivot_longer(
+    cols      = all_of(cover_vars),
+    names_to  = "cover_type",
+    values_to = "pct"
+  ) %>%
+  mutate(
+    cover_type = factor(cover_type, levels = cover_vars),
+    cover_label = cover_labels[as.character(cover_type)]
+  )
+
+cover_summary <- cover_long %>%
+  group_by(cover_type, cover_label, Location, Moraine) %>%
+  summarise(
+    n    = n(),
+    mean = mean(pct, na.rm = TRUE),
+    se   = sd(pct, na.rm = TRUE) / sqrt(sum(!is.na(pct))),
+    .groups = "drop"
+  )
+
+cover_summary %>%
+  mutate(
+    `Mean ± SE` = paste0(round(mean, 1), " ± ", round(se, 1))
+  ) %>%
+  select(cover_label, Location, Moraine, n, `Mean ± SE`) %>%
+  pivot_wider(names_from = Moraine, values_from = c(n, `Mean ± SE`)) %>%
+  kable(caption = "Mean (± SE) cover (%) by cover type, location, and moraine age") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## Visualisation — cover across chronosequence
+
+```{r cover-violin-plots, fig.width=10, fig.height=14}
+p_list <- lapply(cover_vars, function(cv) {
+  d <- cover_long %>%
+    filter(cover_type == cv) %>%
+    mutate(Moraine = factor(Moraine, levels = c("A", "B", "C")))
+
+  ggplot(d, aes(x = Moraine, y = pct, fill = Moraine)) +
+    geom_violin(trim = FALSE, scale = "width", alpha = 0.7, colour = NA) +
+    geom_boxplot(width = 0.12, fill = "white", outlier.shape = NA, colour = "grey30") +
+    geom_jitter(
+      aes(shape = Location),
+      width = 0.08, size = 1.8, alpha = 0.75,
+      colour = "grey20"
+    ) +
+    facet_wrap(~ Location) +
+    scale_fill_manual(values = moraine_colours) +
+    scale_shape_manual(values = location_shapes) +
+    scale_x_discrete(labels = moraine_labels) +
+    labs(
+      title = cover_labels[[cv]],
+      x     = "Moraine age",
+      y     = "Cover (%)"
+    ) +
+    theme_bw(base_size = 11) +
+    theme(
+      legend.position = "none",
+      strip.background = element_rect(fill = "grey92"),
+      plot.title = element_text(face = "bold", size = 11)
+    )
+})
+
+wrap_plots(p_list, ncol = 2)
+```
+
+## Statistical analysis
+
+Cover data are plot-level measurements (one row per plot), so a random-intercept LMER
+is not appropriate. Instead:
+
+- **Moraine effect** — Kruskal-Wallis test (non-parametric; small *n* per group) with
+  pairwise Wilcoxon post-hoc and Benjamini–Hochberg FDR across the seven cover types.
+- **Location effect** — Wilcoxon rank-sum test (Nubra vs Tsomoriri) with BH-FDR.
+- **Environmental drivers** — Spearman *ρ* between each cover type and continuous
+  environmental variables; BH-FDR within each cover type.
+
+Environmental variables tested: distance from glacier, elevation, slope, topographic
+position index (TPI), aspect (sin/cos), snow cover 1976.
+
+```{r stats-compute}
+# ── Environmental variable list ───────────────────────────────────────────────
+env_vars <- c(
+  "DistanceFromGlacier", "Elevation", "Slope", "TPI",
+  "Aspect_sin", "Aspect_cos", "Snow_1976"
+)
+env_labels <- c(
+  DistanceFromGlacier = "Distance from glacier",
+  Elevation           = "Elevation (m)",
+  Slope               = "Slope (°)",
+  TPI                 = "TPI",
+  Aspect_sin          = "Aspect (sin)",
+  Aspect_cos          = "Aspect (cos)",
+  Snow_1976           = "Snow cover 1976"
+)
+
+# Coerce env vars to numeric
+plot_meta <- plot_meta %>%
+  mutate(across(any_of(env_vars), as.numeric))
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+fmt_p <- function(p) {
+  ifelse(is.na(p), "—",
+    ifelse(p < 0.001, "<0.001",
+      ifelse(p < 0.01, formatC(p, digits = 3, format = "f"),
+        formatC(p, digits = 3, format = "f"))))
+}
+
+sig_stars <- function(p) {
+  ifelse(is.na(p), "",
+    ifelse(p < 0.001, "***",
+      ifelse(p < 0.01, "**",
+        ifelse(p < 0.05, "*", ""))))
+}
+
+# ── 1. Kruskal-Wallis: Moraine effect ────────────────────────────────────────
+kw_results <- lapply(cover_vars, function(cv) {
+  x <- plot_meta[[cv]]
+  g <- plot_meta$Moraine
+  ok <- !is.na(x) & !is.na(g)
+  kt <- tryCatch(kruskal.test(x[ok] ~ g[ok]), error = function(e) NULL)
+  if (is.null(kt)) return(tibble(cover_type = cv, H = NA_real_, df = NA_real_, p_kw = NA_real_))
+  tibble(cover_type = cv, H = kt$statistic, df = kt$parameter, p_kw = kt$p.value)
+}) %>% bind_rows() %>%
+  mutate(Padj_kw = p.adjust(p_kw, method = "BH"))
+
+# ── 2. Pairwise Wilcoxon: Moraine post-hoc ───────────────────────────────────
+pw_moraine_results <- lapply(cover_vars, function(cv) {
+  x <- plot_meta[[cv]]
+  g <- plot_meta$Moraine
+  ok <- !is.na(x) & !is.na(g)
+  pw <- tryCatch(
+    pairwise.wilcox.test(x[ok], g[ok], p.adjust.method = "none", exact = FALSE),
+    error = function(e) NULL
+  )
+  if (is.null(pw)) return(tibble(cover_type = cv, contrast = NA_character_, p_pw = NA_real_))
+  pm <- pw$p.value
+  pairs_df <- expand.grid(
+    g1 = rownames(pm), g2 = colnames(pm), stringsAsFactors = FALSE
+  ) %>%
+    filter(!is.na(pm[cbind(g1, g2)])) %>%
+    mutate(
+      cover_type = cv,
+      contrast   = paste(g1, g2, sep = "-"),
+      p_pw       = pm[cbind(g1, g2)]
+    ) %>%
+    select(cover_type, contrast, p_pw)
+  pairs_df
+}) %>% bind_rows()
+
+# CLD letters from pairwise Wilcoxon (unadjusted p)
+cld_moraine <- lapply(cover_vars, function(cv) {
+  pw <- pw_moraine_results %>% filter(cover_type == cv, !is.na(p_pw))
+  if (!nrow(pw)) return(tibble(cover_type = cv, Moraine = NA_character_, CLD = NA_character_))
+  pvals <- setNames(pw$p_pw, pw$contrast)
+  ml <- tryCatch(
+    multcompView::multcompLetters(pvals, threshold = alpha),
+    error = function(e) NULL
+  )
+  if (is.null(ml)) return(tibble(cover_type = cv, Moraine = NA_character_, CLD = NA_character_))
+  tibble(cover_type = cv, Moraine = names(ml$Letters), CLD = trimws(unname(ml$Letters)))
+}) %>% bind_rows()
+
+# ── 3. Wilcoxon: Location effect ─────────────────────────────────────────────
+loc_results <- lapply(cover_vars, function(cv) {
+  x <- plot_meta[[cv]]
+  g <- plot_meta$Location
+  ok <- !is.na(x) & !is.na(g) & length(unique(g[!is.na(g)])) == 2
+  wt <- tryCatch(
+    wilcox.test(x[ok] ~ g[ok], exact = FALSE),
+    error = function(e) NULL
+  )
+  if (is.null(wt)) return(tibble(cover_type = cv, W = NA_real_, p_loc = NA_real_))
+  tibble(cover_type = cv, W = wt$statistic, p_loc = wt$p.value)
+}) %>% bind_rows() %>%
+  mutate(Padj_loc = p.adjust(p_loc, method = "BH"))
+
+# ── 4. Spearman correlations: env drivers ────────────────────────────────────
+spearman_results <- bind_rows(lapply(cover_vars, function(cv) {
+  bind_rows(lapply(env_vars, function(ev) {
+    x <- as.numeric(plot_meta[[cv]])
+    y <- as.numeric(plot_meta[[ev]])
+    ok <- !is.na(x) & !is.na(y)
+    if (sum(ok) < 5) return(tibble(cover_type = cv, env_var = ev, rho = NA_real_, p_sp = NA_real_))
+    ct <- tryCatch(cor.test(x[ok], y[ok], method = "spearman", exact = FALSE),
+                   error = function(e) NULL)
+    if (is.null(ct)) return(tibble(cover_type = cv, env_var = ev, rho = NA_real_, p_sp = NA_real_))
+    tibble(cover_type = cv, env_var = ev, rho = ct$estimate, p_sp = ct$p.value)
+  }))
+})) %>%
+  group_by(cover_type) %>%
+  mutate(Padj_sp = p.adjust(p_sp, method = "BH")) %>%
+  ungroup()
+```
+
+## Summary table — moraine & location effects
+
+Kruskal-Wallis H (Moraine) and Wilcoxon W (Location), with BH-FDR across seven cover
+types. Group means shown for each moraine age; CLD letters (unadjusted pairwise Wilcoxon,
+α = 0.05) indicate significant differences.
+
+```{r summary-table-moraine}
+# Group means per moraine
+moraine_means <- cover_long %>%
+  group_by(cover_type, Moraine) %>%
+  summarise(mean_pct = round(mean(pct, na.rm = TRUE), 1), .groups = "drop") %>%
+  pivot_wider(names_from = Moraine, values_from = mean_pct,
+              names_prefix = "Mean_")
+
+# Join CLD letters
+cld_wide <- cld_moraine %>%
+  filter(!is.na(Moraine)) %>%
+  pivot_wider(names_from = Moraine, values_from = CLD, names_prefix = "CLD_")
+
+# Assemble summary
+summary_moraine <- kw_results %>%
+  left_join(loc_results %>% select(cover_type, W, p_loc, Padj_loc), by = "cover_type") %>%
+  left_join(moraine_means, by = "cover_type") %>%
+  left_join(cld_wide,      by = "cover_type") %>%
+  mutate(
+    cover_label = cover_labels[cover_type],
+    # Combine mean + letter into single cell
+    `Young (A)`        = paste0(Mean_A, if_else(!is.na(CLD_A), paste0(" ", CLD_A), "")),
+    `Intermediate (B)` = paste0(Mean_B, if_else(!is.na(CLD_B), paste0(" ", CLD_B), "")),
+    `Old (C)`          = paste0(Mean_C, if_else(!is.na(CLD_C), paste0(" ", CLD_C), "")),
+    KW_H    = round(H, 2),
+    KW_Padj = fmt_p(Padj_kw),
+    KW_sig  = sig_stars(Padj_kw),
+    Loc_W   = round(W, 1),
+    Loc_Padj = fmt_p(Padj_loc),
+    Loc_sig  = sig_stars(Padj_loc)
+  ) %>%
+  select(
+    `Cover type` = cover_label,
+    `Young (A)`, `Intermediate (B)`, `Old (C)`,
+    `KW H` = KW_H, `KW Padj` = KW_Padj, ` ` = KW_sig,
+    `W` = Loc_W, `Loc Padj` = Loc_Padj, `  ` = Loc_sig
+  )
+
+summary_moraine %>%
+  kable(
+    caption = paste0(
+      "Mean cover (%) by moraine age with compact-letter display (CLD, unadjusted Wilcoxon α = 0.05). ",
+      "KW = Kruskal-Wallis H statistic (Moraine effect, BH-FDR). ",
+      "W = Wilcoxon rank-sum statistic (Nubra vs Tsomoriri, BH-FDR). ",
+      "*** p < 0.001, ** p < 0.01, * p < 0.05."
+    ),
+    escape = FALSE, align = "lrrrrrrrrrr"
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  add_header_above(c(" " = 1, "Mean cover (%) + CLD" = 3,
+                     "Moraine (KW)" = 3, "Location (Wilcoxon)" = 3)) %>%
+  column_spec(7, bold = TRUE) %>%
+  column_spec(10, bold = TRUE)
+```
+
+## Summary table — environmental drivers (Spearman *ρ*)
+
+Spearman correlation between each cover type and continuous environmental variables.
+BH-FDR within cover type across seven environmental variables.
+Values shown as *ρ* (FDR-adjusted *p*); bold = significant (Padj < 0.05).
+
+```{r summary-table-env}
+# Build wide table: one column per env var, cell = "ρ stars (Padj)"
+env_wide <- spearman_results %>%
+  mutate(
+    cover_label = cover_labels[cover_type],
+    env_label   = env_labels[env_var],
+    cell = case_when(
+      is.na(rho) ~ "—",
+      TRUE ~ paste0(
+        formatC(rho, digits = 2, format = "f"),
+        sig_stars(Padj_sp),
+        " (", fmt_p(Padj_sp), ")"
+      )
+    )
+  ) %>%
+  select(cover_label, env_label, cell) %>%
+  pivot_wider(names_from = env_label, values_from = cell)
+
+env_wide %>%
+  rename(`Cover type` = cover_label) %>%
+  kable(
+    caption = paste0(
+      "Spearman \u03c1 with BH-FDR adjusted p in parentheses. ",
+      "Stars: *** p<0.001, ** p<0.01, * p<0.05."
+    ),
+    escape = TRUE, align = "lrrrrrrr"
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  row_spec(
+    which(env_wide$cover_label %in% cover_labels[
+      spearman_results %>%
+        filter(Padj_sp < alpha) %>%
+        pull(cover_type) %>%
+        unique()
+    ]),
+    background = "#f0f7ff"
+  )
+```
+
+## Pairwise Wilcoxon — significant moraine contrasts
+
+Full pairwise tables for cover types with significant Kruskal-Wallis (Padj < 0.05).
+
+```{r pairwise-detail, results='asis'}
+sig_kw <- kw_results %>% filter(Padj_kw < alpha) %>% pull(cover_type)
+
+for (cv in sig_kw) {
+  lbl <- cover_labels[[cv]]
+  pw  <- pw_moraine_results %>%
+    filter(cover_type == cv, !is.na(p_pw)) %>%
+    mutate(Padj = p.adjust(p_pw, method = "BH"),
+           Sig  = sig_stars(Padj)) %>%
+    select(Contrast = contrast, `p (unadj)` = p_pw, `Padj (BH)` = Padj, ` ` = Sig) %>%
+    mutate(across(where(is.numeric), ~ round(.x, 4)))
+
+  cat(
+    pw %>%
+      kable(format = "html",
+            caption = paste0(lbl, " — pairwise Wilcoxon by moraine age"),
+            escape = FALSE) %>%
+      kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+      as.character(),
+    "\n\n"
+  )
+}
+```
+
+## Cover change along the glacier retreat gradient
+
+Cover variables scaled 0–1 (each variable divided by its within-`GlacierID` maximum) and plotted
+against distance from glacier. Point shape indicates location (Nubra = circle;
+Tsomoriri = triangle), while fill indicates moraine age (young = brown,
+intermediate = light green, old = dark green). Trend line = linear fit ± 95% CI
+across both locations combined. Spearman *ρ* and FDR-adjusted *p* (from the table
+above) are annotated on each panel; the straight line is a visual summary of trend
+direction rather than a separate inferential test.
+
+```{r cover-distance-plots, fig.width = 11, fig.height = 14}
+# ── Scale each cover variable 0-1 by the within-GlacierID maximum ─────────────
+cover_scaled <- plot_meta %>%
+  select(Plot, GlacierID, Location, Moraine, Moraine_num, DistanceFromGlacier, all_of(cover_vars)) %>%
+  group_by(GlacierID) %>%
+  mutate(across(
+    all_of(cover_vars),
+    ~ {
+      mx <- max(.x, na.rm = TRUE)
+      if (is.na(mx) || mx == 0) NA_real_ else .x / mx
+    }
+  )) %>%
+  ungroup() %>%
+  pivot_longer(
+    cols      = all_of(cover_vars),
+    names_to  = "cover_type",
+    values_to = "scaled_cover"
+  ) %>%
+  mutate(
+    cover_label = cover_labels[cover_type],
+    cover_label = factor(cover_label, levels = cover_labels),
+    Moraine     = factor(Moraine, levels = c("A", "B", "C")),
+    Location    = factor(Location)
+  )
+
+# Pull Spearman annotation per cover type
+sp_annot <- spearman_results %>%
+  filter(env_var == "DistanceFromGlacier") %>%
+  mutate(
+    cover_label = cover_labels[cover_type],
+    cover_label = factor(cover_label, levels = cover_labels),
+    label = paste0(
+      "\u03c1 = ", formatC(rho, digits = 2, format = "f"),
+      sig_stars(Padj_sp),
+      "\nPadj = ", fmt_p(Padj_sp)
+    )
+  )
+
+p_cover_distance <- ggplot(cover_scaled, aes(x = DistanceFromGlacier, y = scaled_cover)) +
+  # Linear trend across both locations combined
+  geom_smooth(
+    method  = "lm", formula = y ~ x,
+    colour  = "grey30", fill = "grey80", linewidth = 0.8, alpha = 0.3,
+    na.rm   = TRUE
+  ) +
+  # Points coloured by moraine age, shaped by location
+  geom_point(
+    aes(fill = Moraine, shape = Location),
+    size = 3, colour = "white", stroke = 0.6, na.rm = TRUE
+  ) +
+  # Spearman annotation (top-left of each facet)
+  geom_text(
+    data  = sp_annot,
+    aes(label = label),
+    x     = -Inf, y = Inf,
+    hjust = -0.08, vjust = 1.3,
+    size  = 3, colour = "grey20", inherit.aes = FALSE
+  ) +
+  facet_wrap(~ cover_label, ncol = 2, scales = "free_x") +
+  scale_fill_manual(
+    values = moraine_colours, name = "Moraine age",
+    labels = moraine_labels
+  ) +
+  scale_shape_manual(values = location_shapes, name = "Location") +
+  scale_y_continuous(
+    limits = c(0, 1.05), breaks = seq(0, 1, 0.25),
+    labels = scales::label_percent(accuracy = 1)
+  ) +
+  guides(
+    fill  = guide_legend(override.aes = list(shape = 21, size = 3.5)),
+    shape = guide_legend(override.aes = list(fill = "grey60", size = 3.5))
+  ) +
+  labs(
+    x = "Distance from glacier (m)",
+    y = "Scaled cover (proportion of GlacierID maximum)"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    strip.background  = element_rect(fill = "grey92"),
+    strip.text        = element_text(face = "bold", size = 10),
+    legend.position   = "bottom",
+    legend.box        = "horizontal",
+    panel.grid.minor  = element_blank()
+  )
+
+p_cover_distance
+```
+
+### Cover change along the glacier retreat gradient — raw values
+
+Same distance-gradient plot as above, but using raw cover percentages rather than
+within-`GlacierID` scaled values.
+
+```{r cover-distance-raw-plots, fig.width = 11, fig.height = 14}
+cover_raw_distance <- plot_meta %>%
+  select(Plot, Location, Moraine, DistanceFromGlacier, all_of(cover_vars)) %>%
+  pivot_longer(
+    cols      = all_of(cover_vars),
+    names_to  = "cover_type",
+    values_to = "cover_pct"
+  ) %>%
+  mutate(
+    cover_label = cover_labels[cover_type],
+    cover_label = factor(cover_label, levels = cover_labels),
+    Moraine     = factor(Moraine, levels = c("A", "B", "C")),
+    Location    = factor(Location)
+  )
+
+p_cover_distance_raw <- ggplot(cover_raw_distance, aes(x = DistanceFromGlacier, y = cover_pct)) +
+  geom_smooth(
+    method  = "lm", formula = y ~ x,
+    colour  = "grey30", fill = "grey80", linewidth = 0.8, alpha = 0.3,
+    na.rm   = TRUE
+  ) +
+  geom_point(
+    aes(fill = Moraine, shape = Location),
+    size = 3, colour = "white", stroke = 0.6, na.rm = TRUE
+  ) +
+  geom_text(
+    data  = sp_annot,
+    aes(label = label),
+    x     = -Inf, y = Inf,
+    hjust = -0.08, vjust = 1.3,
+    size  = 3, colour = "grey20", inherit.aes = FALSE
+  ) +
+  facet_wrap(~ cover_label, ncol = 2, scales = "free_y") +
+  scale_fill_manual(
+    values = moraine_colours, name = "Moraine age",
+    labels = moraine_labels
+  ) +
+  scale_shape_manual(values = location_shapes, name = "Location") +
+  guides(
+    fill  = guide_legend(override.aes = list(shape = 21, size = 3.5)),
+    shape = guide_legend(override.aes = list(fill = "grey60", size = 3.5))
+  ) +
+  labs(
+    x = "Distance from glacier (m)",
+    y = "Cover (%)"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    strip.background  = element_rect(fill = "grey92"),
+    strip.text        = element_text(face = "bold", size = 10),
+    legend.position   = "bottom",
+    legend.box        = "horizontal",
+    panel.grid.minor  = element_blank()
+  )
+
+p_cover_distance_raw
+```
+
+### Cover change along ordinal moraine age
+
+Same scaled cover values as above, but plotted against moraine age treated as an
+ordinal numeric gradient (`Young/A = 1`, `Intermediate/B = 2`, `Old/C = 3`).
+
+```{r cover-moraine-age-plots, fig.width = 11, fig.height = 14}
+cover_moraine_sp <- cover_scaled %>%
+  group_by(cover_type, cover_label) %>%
+  group_modify(~ {
+    ok <- complete.cases(.x$Moraine_num, .x$scaled_cover)
+    if (sum(ok) < 5) {
+      return(tibble(rho = NA_real_, p_sp = NA_real_))
+    }
+    ct <- cor.test(
+      .x$Moraine_num[ok],
+      .x$scaled_cover[ok],
+      method = "spearman",
+      exact = FALSE
+    )
+    tibble(rho = unname(ct$estimate), p_sp = ct$p.value)
+  }) %>%
+  ungroup() %>%
+  mutate(
+    Padj_sp = p.adjust(p_sp, method = "BH"),
+    label = paste0(
+      "\u03c1 = ", formatC(rho, digits = 2, format = "f"),
+      sig_stars(Padj_sp),
+      "\nPadj = ", fmt_p(Padj_sp)
+    )
+  )
+
+p_cover_moraine_age <- ggplot(cover_scaled, aes(x = Moraine_num, y = scaled_cover)) +
+  geom_smooth(
+    method  = "loess", formula = y ~ x, span = 1.5,
+    colour  = "grey30", fill = "grey80", linewidth = 0.8, alpha = 0.3,
+    na.rm   = TRUE
+  ) +
+  geom_point(
+    aes(fill = Moraine, shape = Location),
+    position = position_jitter(width = 0.05, height = 0),
+    size = 3, colour = "white", stroke = 0.6, na.rm = TRUE
+  ) +
+  geom_text(
+    data  = cover_moraine_sp,
+    aes(label = label),
+    x     = -Inf, y = Inf,
+    hjust = -0.08, vjust = 1.3,
+    size  = 3, colour = "grey20", inherit.aes = FALSE
+  ) +
+  facet_wrap(~ cover_label, ncol = 2) +
+  scale_x_continuous(
+    breaks = 1:3,
+    labels = c("Young\n(1)", "Intermediate\n(2)", "Old\n(3)")
+  ) +
+  scale_fill_manual(
+    values = moraine_colours, name = "Moraine age",
+    labels = moraine_labels
+  ) +
+  scale_shape_manual(values = location_shapes, name = "Location") +
+  scale_y_continuous(
+    limits = c(0, 1.05), breaks = seq(0, 1, 0.25),
+    labels = scales::label_percent(accuracy = 1)
+  ) +
+  guides(
+    fill  = guide_legend(override.aes = list(shape = 21, size = 3.5)),
+    shape = guide_legend(override.aes = list(fill = "grey60", size = 3.5))
+  ) +
+  labs(
+    x = "Moraine age class (Young = 1, Intermediate = 2, Old = 3)",
+    y = "Scaled cover (proportion of GlacierID maximum)"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    strip.background  = element_rect(fill = "grey92"),
+    strip.text        = element_text(face = "bold", size = 10),
+    legend.position   = "bottom",
+    legend.box        = "horizontal",
+    panel.grid.minor  = element_blank()
+  )
+
+p_cover_moraine_age
+```
+
+## Soil properties along the glacier retreat gradient
+
+Same scaling (0–1 by within-`GlacierID` variable maximum) and plot style as the cover figures above.
+Environmental variables: pH, organic matter, texture (>2 mm stones), total N, total P,
+and exchangeable cations (Na, Mg, K, Ca).
+
+```{r soil-stats-compute}
+soil_vars <- c("pH", "OM%", "texture_>2mm", "TN_%", "TP_%",
+               "Na_mg_g", "Mg_mg_g", "K_mg_g", "Ca_mg_g")
+
+soil_labels <- c(
+  "pH"           = "pH",
+  "OM%"          = "Organic matter (%)",
+  "texture_>2mm" = "Coarse texture >2 mm (%)",
+  "TN_%"         = "Total N (%)",
+  "TP_%"         = "Total P (%)",
+  "Na_mg_g"      = "Na (mg/g)",
+  "Mg_mg_g"      = "Mg (mg/g)",
+  "K_mg_g"       = "K (mg/g)",
+  "Ca_mg_g"      = "Ca (mg/g)"
+)
+
+# Coerce to numeric (names with special chars can read as character from Excel)
+plot_meta <- plot_meta %>%
+  mutate(across(any_of(soil_vars), as.numeric))
+
+# ── 1. Kruskal-Wallis: Moraine effect ────────────────────────────────────────
+soil_kw <- bind_rows(lapply(soil_vars, function(sv) {
+  x  <- plot_meta[[sv]]
+  g  <- plot_meta$Moraine
+  ok <- !is.na(x) & !is.na(g)
+  kt <- tryCatch(kruskal.test(x[ok] ~ g[ok]), error = function(e) NULL)
+  if (is.null(kt)) return(tibble(soil_var = sv, H = NA_real_, df = NA_real_, p_kw = NA_real_))
+  tibble(soil_var = sv, H = kt$statistic, df = kt$parameter, p_kw = kt$p.value)
+})) %>%
+  mutate(Padj_kw = p.adjust(p_kw, method = "BH"))
+
+# ── 2. Pairwise Wilcoxon post-hoc (Moraine) ──────────────────────────────────
+soil_pw_moraine <- bind_rows(lapply(soil_vars, function(sv) {
+  x  <- plot_meta[[sv]]
+  g  <- plot_meta$Moraine
+  ok <- !is.na(x) & !is.na(g)
+  pw <- tryCatch(
+    pairwise.wilcox.test(x[ok], g[ok], p.adjust.method = "none", exact = FALSE),
+    error = function(e) NULL
+  )
+  if (is.null(pw)) return(tibble(soil_var = sv, contrast = NA_character_, p_pw = NA_real_))
+  pm <- pw$p.value
+  expand.grid(g1 = rownames(pm), g2 = colnames(pm), stringsAsFactors = FALSE) %>%
+    filter(!is.na(pm[cbind(g1, g2)])) %>%
+    mutate(soil_var = sv, contrast = paste(g1, g2, sep = "-"),
+           p_pw = pm[cbind(g1, g2)]) %>%
+    select(soil_var, contrast, p_pw)
+}))
+
+# CLD letters per soil variable
+soil_cld_moraine <- bind_rows(lapply(soil_vars, function(sv) {
+  pw <- soil_pw_moraine %>% filter(soil_var == sv, !is.na(p_pw))
+  if (!nrow(pw)) return(tibble(soil_var = sv, Moraine = NA_character_, CLD = NA_character_))
+  pvals <- setNames(pw$p_pw, pw$contrast)
+  ml <- tryCatch(
+    multcompView::multcompLetters(pvals, threshold = alpha),
+    error = function(e) NULL
+  )
+  if (is.null(ml)) return(tibble(soil_var = sv, Moraine = NA_character_, CLD = NA_character_))
+  tibble(soil_var = sv, Moraine = names(ml$Letters), CLD = trimws(unname(ml$Letters)))
+}))
+
+# ── 3. Wilcoxon: Location effect ─────────────────────────────────────────────
+soil_loc <- bind_rows(lapply(soil_vars, function(sv) {
+  x  <- plot_meta[[sv]]
+  g  <- plot_meta$Location
+  ok <- !is.na(x) & !is.na(g)
+  wt <- tryCatch(wilcox.test(x[ok] ~ g[ok], exact = FALSE), error = function(e) NULL)
+  if (is.null(wt)) return(tibble(soil_var = sv, W = NA_real_, p_loc = NA_real_))
+  tibble(soil_var = sv, W = wt$statistic, p_loc = wt$p.value)
+})) %>%
+  mutate(Padj_loc = p.adjust(p_loc, method = "BH"))
+
+# ── 4. Spearman: all env vars ─────────────────────────────────────────────────
+soil_spearman_all <- bind_rows(lapply(soil_vars, function(sv) {
+  bind_rows(lapply(env_vars, function(ev) {
+    x  <- as.numeric(plot_meta[[ev]])
+    y  <- as.numeric(plot_meta[[sv]])
+    ok <- !is.na(x) & !is.na(y)
+    if (sum(ok) < 5) return(tibble(soil_var = sv, env_var = ev, rho = NA_real_, p_sp = NA_real_))
+    ct <- tryCatch(cor.test(x[ok], y[ok], method = "spearman", exact = FALSE),
+                   error = function(e) NULL)
+    if (is.null(ct)) return(tibble(soil_var = sv, env_var = ev, rho = NA_real_, p_sp = NA_real_))
+    tibble(soil_var = sv, env_var = ev, rho = ct$estimate, p_sp = ct$p.value)
+  }))
+})) %>%
+  group_by(soil_var) %>%
+  mutate(Padj_sp = p.adjust(p_sp, method = "BH")) %>%
+  ungroup()
+
+# Convenience alias for the distance-from-glacier subset (used by the plot below)
+soil_spearman <- soil_spearman_all %>% filter(env_var == "DistanceFromGlacier") %>%
+  select(soil_var, rho, p_sp, Padj_sp)
+```
+
+### Moraine & location effects — summary table
+
+```{r soil-summary-table}
+# Group means per moraine
+soil_long <- plot_meta %>%
+  select(Plot, Location, Moraine, any_of(soil_vars)) %>%
+  pivot_longer(cols = any_of(soil_vars), names_to = "soil_var", values_to = "value") %>%
+  mutate(Moraine = factor(Moraine, levels = c("A", "B", "C")))
+
+soil_moraine_means <- soil_long %>%
+  group_by(soil_var, Moraine) %>%
+  summarise(mean_val = round(mean(value, na.rm = TRUE), 3), .groups = "drop") %>%
+  pivot_wider(names_from = Moraine, values_from = mean_val, names_prefix = "Mean_")
+
+soil_cld_wide <- soil_cld_moraine %>%
+  filter(!is.na(Moraine)) %>%
+  pivot_wider(names_from = Moraine, values_from = CLD, names_prefix = "CLD_")
+
+soil_summary <- soil_kw %>%
+  left_join(soil_loc %>% select(soil_var, W, p_loc, Padj_loc), by = "soil_var") %>%
+  left_join(soil_moraine_means,  by = "soil_var") %>%
+  left_join(soil_cld_wide,       by = "soil_var") %>%
+  mutate(
+    soil_label = soil_labels[soil_var],
+    `Young (A)`        = paste0(Mean_A, if_else(!is.na(CLD_A), paste0(" ", CLD_A), "")),
+    `Intermediate (B)` = paste0(Mean_B, if_else(!is.na(CLD_B), paste0(" ", CLD_B), "")),
+    `Old (C)`          = paste0(Mean_C, if_else(!is.na(CLD_C), paste0(" ", CLD_C), "")),
+    KW_H     = round(H, 2),
+    KW_Padj  = fmt_p(Padj_kw),
+    KW_sig   = sig_stars(Padj_kw),
+    Loc_W    = round(W, 1),
+    Loc_Padj = fmt_p(Padj_loc),
+    Loc_sig  = sig_stars(Padj_loc)
+  ) %>%
+  select(
+    `Soil property` = soil_label,
+    `Young (A)`, `Intermediate (B)`, `Old (C)`,
+    `KW H` = KW_H, `KW Padj` = KW_Padj, ` ` = KW_sig,
+    `W` = Loc_W, `Loc Padj` = Loc_Padj, `  ` = Loc_sig
+  )
+
+soil_summary %>%
+  kable(
+    caption = paste0(
+      "Mean soil property by moraine age with compact-letter display ",
+      "(CLD, unadjusted pairwise Wilcoxon, \u03b1 = 0.05). ",
+      "KW = Kruskal-Wallis H (Moraine, BH-FDR). ",
+      "W = Wilcoxon rank-sum (Nubra vs Tsomoriri, BH-FDR). ",
+      "*** p<0.001, ** p<0.01, * p<0.05."
+    ),
+    escape = FALSE, align = "lrrrrrrrrrr"
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  add_header_above(c(" " = 1, "Mean value + CLD" = 3,
+                     "Moraine (KW)" = 3, "Location (Wilcoxon)" = 3)) %>%
+  column_spec(7, bold = TRUE) %>%
+  column_spec(10, bold = TRUE)
+```
+
+### Environmental drivers — Spearman *ρ* table
+
+```{r soil-env-table}
+soil_env_wide <- soil_spearman_all %>%
+  mutate(
+    soil_label = soil_labels[soil_var],
+    soil_label = factor(soil_label, levels = soil_labels),
+    env_label  = env_labels[env_var],
+    cell = case_when(
+      is.na(rho) ~ "—",
+      TRUE ~ paste0(
+        formatC(rho, digits = 2, format = "f"),
+        sig_stars(Padj_sp),
+        " (", fmt_p(Padj_sp), ")"
+      )
+    )
+  ) %>%
+  select(soil_label, env_label, cell) %>%
+  pivot_wider(names_from = env_label, values_from = cell)
+
+soil_env_wide %>%
+  rename(`Soil property` = soil_label) %>%
+  kable(
+    caption = paste0(
+      "Spearman \u03c1 (BH-FDR adjusted p) — soil properties vs environmental variables. ",
+      "Stars: *** p<0.001, ** p<0.01, * p<0.05."
+    ),
+    escape = TRUE, align = "lrrrrrrr"
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+### Pairwise Wilcoxon — significant moraine contrasts
+
+```{r soil-pairwise-detail, results='asis'}
+sig_soil_kw <- soil_kw %>% filter(Padj_kw < alpha) %>% pull(soil_var)
+
+for (sv in sig_soil_kw) {
+  lbl <- soil_labels[[sv]]
+  pw  <- soil_pw_moraine %>%
+    filter(soil_var == sv, !is.na(p_pw)) %>%
+    mutate(Padj = p.adjust(p_pw, method = "BH"),
+           Sig  = sig_stars(Padj)) %>%
+    select(Contrast = contrast, `p (unadj)` = p_pw, `Padj (BH)` = Padj, ` ` = Sig) %>%
+    mutate(across(where(is.numeric), ~ round(.x, 4)))
+  cat(
+    pw %>%
+      kable(format = "html",
+            caption = paste0(lbl, " — pairwise Wilcoxon by moraine age"),
+            escape = FALSE) %>%
+      kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+      as.character(),
+    "\n\n"
+  )
+}
+```
+
+```{r soil-distance-plots, fig.width = 11, fig.height = 16}
+# Scale each soil variable 0-1 by the within-GlacierID maximum
+soil_scaled <- plot_meta %>%
+  select(Plot, GlacierID, Location, Moraine, Moraine_num, DistanceFromGlacier, any_of(soil_vars)) %>%
+  group_by(GlacierID) %>%
+  mutate(across(
+    any_of(soil_vars),
+    ~ {
+      mx <- max(.x, na.rm = TRUE)
+      if (is.na(mx) || mx == 0) NA_real_ else .x / mx
+    }
+  )) %>%
+  ungroup() %>%
+  pivot_longer(
+    cols      = any_of(soil_vars),
+    names_to  = "soil_var",
+    values_to = "scaled_val"
+  ) %>%
+  mutate(
+    soil_label = soil_labels[soil_var],
+    soil_label = factor(soil_label, levels = soil_labels),
+    Moraine    = factor(Moraine, levels = c("A", "B", "C")),
+    Location   = factor(Location)
+  )
+
+# Spearman annotation per panel
+soil_sp_annot <- soil_spearman %>%
+  mutate(
+    soil_label = soil_labels[soil_var],
+    soil_label = factor(soil_label, levels = soil_labels),
+    label = paste0(
+      "\u03c1 = ", formatC(rho, digits = 2, format = "f"),
+      sig_stars(Padj_sp),
+      "\nPadj = ", fmt_p(Padj_sp)
+    )
+  )
+
+p_soil_distance <- ggplot(soil_scaled, aes(x = DistanceFromGlacier, y = scaled_val)) +
+  geom_smooth(
+    method  = "lm", formula = y ~ x,
+    colour  = "grey30", fill = "grey80", linewidth = 0.8, alpha = 0.3,
+    na.rm   = TRUE
+  ) +
+  geom_point(
+    aes(fill = Moraine, shape = Location),
+    size = 3, colour = "white", stroke = 0.6, na.rm = TRUE
+  ) +
+  geom_text(
+    data  = soil_sp_annot,
+    aes(label = label),
+    x     = -Inf, y = Inf,
+    hjust = -0.08, vjust = 1.3,
+    size  = 3, colour = "grey20", inherit.aes = FALSE
+  ) +
+  facet_wrap(~ soil_label, ncol = 2, scales = "free_x") +
+  scale_fill_manual(
+    values = moraine_colours, name = "Moraine age",
+    labels = moraine_labels
+  ) +
+  scale_shape_manual(values = location_shapes, name = "Location") +
+  scale_y_continuous(
+    limits = c(0, 1.05), breaks = seq(0, 1, 0.25),
+    labels = scales::label_percent(accuracy = 1)
+  ) +
+  guides(
+    fill  = guide_legend(override.aes = list(shape = 21, size = 3.5)),
+    shape = guide_legend(override.aes = list(fill = "grey60", size = 3.5))
+  ) +
+  labs(
+    x = "Distance from glacier (m)",
+    y = "Scaled value (proportion of GlacierID maximum)"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    strip.background = element_rect(fill = "grey92"),
+    strip.text       = element_text(face = "bold", size = 10),
+    legend.position  = "bottom",
+    legend.box       = "horizontal",
+    panel.grid.minor = element_blank()
+  )
+
+p_soil_distance
+```
+
+### Soil properties along the glacier retreat gradient — raw values
+
+Same distance-gradient plot as above, but using raw soil chemistry values rather
+than within-`GlacierID` scaled values.
+
+```{r soil-distance-raw-plots, fig.width = 11, fig.height = 16}
+soil_raw_distance <- plot_meta %>%
+  select(Plot, Location, Moraine, DistanceFromGlacier, any_of(soil_vars)) %>%
+  pivot_longer(
+    cols      = any_of(soil_vars),
+    names_to  = "soil_var",
+    values_to = "soil_value"
+  ) %>%
+  mutate(
+    soil_label = soil_labels[soil_var],
+    soil_label = factor(soil_label, levels = soil_labels),
+    Moraine    = factor(Moraine, levels = c("A", "B", "C")),
+    Location   = factor(Location)
+  )
+
+p_soil_distance_raw <- ggplot(soil_raw_distance, aes(x = DistanceFromGlacier, y = soil_value)) +
+  geom_smooth(
+    method  = "lm", formula = y ~ x,
+    colour  = "grey30", fill = "grey80", linewidth = 0.8, alpha = 0.3,
+    na.rm   = TRUE
+  ) +
+  geom_point(
+    aes(fill = Moraine, shape = Location),
+    size = 3, colour = "white", stroke = 0.6, na.rm = TRUE
+  ) +
+  geom_text(
+    data  = soil_sp_annot,
+    aes(label = label),
+    x     = -Inf, y = Inf,
+    hjust = -0.08, vjust = 1.3,
+    size  = 3, colour = "grey20", inherit.aes = FALSE
+  ) +
+  facet_wrap(~ soil_label, ncol = 2, scales = "free_y") +
+  scale_fill_manual(
+    values = moraine_colours, name = "Moraine age",
+    labels = moraine_labels
+  ) +
+  scale_shape_manual(values = location_shapes, name = "Location") +
+  guides(
+    fill  = guide_legend(override.aes = list(shape = 21, size = 3.5)),
+    shape = guide_legend(override.aes = list(fill = "grey60", size = 3.5))
+  ) +
+  labs(
+    x = "Distance from glacier (m)",
+    y = "Raw soil chemistry value"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    strip.background = element_rect(fill = "grey92"),
+    strip.text       = element_text(face = "bold", size = 10),
+    legend.position  = "bottom",
+    legend.box       = "horizontal",
+    panel.grid.minor = element_blank()
+  )
+
+p_soil_distance_raw
+```
+
+### Soil properties along ordinal moraine age
+
+Same scaled soil-property values as above, but plotted against moraine age treated
+as an ordinal numeric gradient (`Young/A = 1`, `Intermediate/B = 2`, `Old/C = 3`).
+
+```{r soil-moraine-age-plots, fig.width = 11, fig.height = 16}
+soil_moraine_sp <- soil_scaled %>%
+  group_by(soil_var, soil_label) %>%
+  group_modify(~ {
+    ok <- complete.cases(.x$Moraine_num, .x$scaled_val)
+    if (sum(ok) < 5) {
+      return(tibble(rho = NA_real_, p_sp = NA_real_))
+    }
+    ct <- cor.test(
+      .x$Moraine_num[ok],
+      .x$scaled_val[ok],
+      method = "spearman",
+      exact = FALSE
+    )
+    tibble(rho = unname(ct$estimate), p_sp = ct$p.value)
+  }) %>%
+  ungroup() %>%
+  mutate(
+    Padj_sp = p.adjust(p_sp, method = "BH"),
+    label = paste0(
+      "\u03c1 = ", formatC(rho, digits = 2, format = "f"),
+      sig_stars(Padj_sp),
+      "\nPadj = ", fmt_p(Padj_sp)
+    )
+  )
+
+p_soil_moraine_age <- ggplot(soil_scaled, aes(x = Moraine_num, y = scaled_val)) +
+  geom_smooth(
+    method  = "loess", formula = y ~ x, span = 1.5,
+    colour  = "grey30", fill = "grey80", linewidth = 0.8, alpha = 0.3,
+    na.rm   = TRUE
+  ) +
+  geom_point(
+    aes(fill = Moraine, shape = Location),
+    position = position_jitter(width = 0.05, height = 0),
+    size = 3, colour = "white", stroke = 0.6, na.rm = TRUE
+  ) +
+  geom_text(
+    data  = soil_moraine_sp,
+    aes(label = label),
+    x     = -Inf, y = Inf,
+    hjust = -0.08, vjust = 1.3,
+    size  = 3, colour = "grey20", inherit.aes = FALSE
+  ) +
+  facet_wrap(~ soil_label, ncol = 2) +
+  scale_x_continuous(
+    breaks = 1:3,
+    labels = c("Young\n(1)", "Intermediate\n(2)", "Old\n(3)")
+  ) +
+  scale_fill_manual(
+    values = moraine_colours, name = "Moraine age",
+    labels = moraine_labels
+  ) +
+  scale_shape_manual(values = location_shapes, name = "Location") +
+  scale_y_continuous(
+    limits = c(0, 1.05), breaks = seq(0, 1, 0.25),
+    labels = scales::label_percent(accuracy = 1)
+  ) +
+  guides(
+    fill  = guide_legend(override.aes = list(shape = 21, size = 3.5)),
+    shape = guide_legend(override.aes = list(fill = "grey60", size = 3.5))
+  ) +
+  labs(
+    x = "Moraine age class (Young = 1, Intermediate = 2, Old = 3)",
+    y = "Scaled value (proportion of GlacierID maximum)"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    strip.background = element_rect(fill = "grey92"),
+    strip.text       = element_text(face = "bold", size = 10),
+    legend.position  = "bottom",
+    legend.box       = "horizontal",
+    panel.grid.minor = element_blank()
+  )
+
+p_soil_moraine_age
+```
+
+### Export smoothed cover and soil figures
+
+```{r export-cover-soil-smoothed-figures, message=FALSE, warning=FALSE}
+cover_fig_dir <- file.path(project_root, "Cover_figures_REVISION")
+dir.create(cover_fig_dir, recursive = TRUE, showWarnings = FALSE)
+
+cover_soil_figures <- list(
+  cover_distance = list(
+    plot = p_cover_distance,
+    width = 11,
+    height = 14,
+    description = "Scaled cover estimates vs distance from glacier"
+  ),
+  cover_distance_raw = list(
+    plot = p_cover_distance_raw,
+    width = 11,
+    height = 14,
+    description = "Raw cover estimates vs distance from glacier"
+  ),
+  cover_moraine_age = list(
+    plot = p_cover_moraine_age,
+    width = 11,
+    height = 14,
+    description = "Cover estimates vs ordinal moraine age"
+  ),
+  soil_distance = list(
+    plot = p_soil_distance,
+    width = 11,
+    height = 16,
+    description = "Scaled soil chemistry vs distance from glacier"
+  ),
+  soil_distance_raw = list(
+    plot = p_soil_distance_raw,
+    width = 11,
+    height = 16,
+    description = "Raw soil chemistry vs distance from glacier"
+  ),
+  soil_moraine_age = list(
+    plot = p_soil_moraine_age,
+    width = 11,
+    height = 16,
+    description = "Soil chemistry vs ordinal moraine age"
+  )
+)
+
+export_cover_soil_figure <- function(name, fig) {
+  png_file <- file.path(cover_fig_dir, paste0(name, "_REVISION.png"))
+  svg_file <- file.path(cover_fig_dir, paste0(name, "_REVISION.svg"))
+
+  ggsave(
+    filename = png_file,
+    plot = fig$plot,
+    width = fig$width,
+    height = fig$height,
+    dpi = 300,
+    bg = "white"
+  )
+
+  save_gg_svg(
+    filename = svg_file,
+    plot = fig$plot,
+    width = fig$width,
+    height = fig$height
+  )
+
+  tibble(
+    figure = name,
+    description = fig$description,
+    png = png_file,
+    svg = svg_file
+  )
+}
+
+cover_soil_export_index <- bind_rows(
+  lapply(names(cover_soil_figures), function(nm) {
+    export_cover_soil_figure(nm, cover_soil_figures[[nm]])
+  })
+)
+
+write.csv(
+  cover_soil_export_index,
+  file.path(cover_fig_dir, "Cover_soil_smoothed_figures_index_REVISION.csv"),
+  row.names = FALSE
+)
+
+cover_soil_export_index %>%
+  kable(caption = "Exported smoothed cover and soil figures") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## Cover × soil relationships
+
+Spearman *ρ* between every cover type and every soil property. BH-FDR correction applied
+across all 63 pairs (7 cover × 9 soil). A heatmap shows the full correlation matrix;
+scatter plots are produced for all pairs with Padj < 0.05.
+
+```{r cover-soil-correlations}
+# ── Full cover × soil Spearman matrix ────────────────────────────────────────
+cover_soil_cor <- bind_rows(lapply(cover_vars, function(cv) {
+  bind_rows(lapply(soil_vars, function(sv) {
+    x  <- as.numeric(plot_meta[[cv]])
+    y  <- as.numeric(plot_meta[[sv]])
+    ok <- !is.na(x) & !is.na(y)
+    if (sum(ok) < 5) {
+      return(tibble(cover_var = cv, soil_var = sv, rho = NA_real_, p_sp = NA_real_))
+    }
+    ct <- tryCatch(
+      cor.test(x[ok], y[ok], method = "spearman", exact = FALSE),
+      error = function(e) NULL
+    )
+    if (is.null(ct)) {
+      return(tibble(cover_var = cv, soil_var = sv, rho = NA_real_, p_sp = NA_real_))
+    }
+    tibble(cover_var = cv, soil_var = sv, rho = ct$estimate, p_sp = ct$p.value)
+  }))
+})) %>%
+  mutate(Padj = p.adjust(p_sp, method = "BH"))
+
+# Significant pairs
+sig_pairs <- cover_soil_cor %>% filter(!is.na(Padj), Padj < alpha)
+cat(nrow(sig_pairs), "significant cover × soil pairs (Padj <", alpha, ")\n")
+
+# Numeric summary table
+cover_soil_cor %>%
+  mutate(
+    cover_label = cover_labels[cover_var],
+    soil_label  = soil_labels[soil_var],
+    cell = paste0(
+      formatC(rho, digits = 2, format = "f"),
+      sig_stars(Padj),
+      " (", fmt_p(Padj), ")"
+    )
+  ) %>%
+  select(cover_label, soil_label, cell) %>%
+  pivot_wider(names_from = soil_label, values_from = cell) %>%
+  rename(`Cover type` = cover_label) %>%
+  kable(
+    caption = paste0(
+      "Spearman \u03c1 (BH-FDR p) — cover types vs soil properties ",
+      "(FDR across all 63 pairs). Stars: *** p<0.001, ** p<0.01, * p<0.05."
+    ),
+    escape = TRUE, align = "lrrrrrrrrr"
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r cover-soil-heatmap, fig.width = 9, fig.height = 5}
+# ── Heatmap of Spearman ρ ─────────────────────────────────────────────────────
+hm_df <- cover_soil_cor %>%
+  mutate(
+    cover_label = factor(cover_labels[cover_var], levels = rev(cover_labels)),
+    soil_label  = factor(soil_labels[soil_var],   levels = soil_labels),
+    sig_label   = case_when(
+      is.na(Padj)   ~ "",
+      Padj < 0.001  ~ "***",
+      Padj < 0.01   ~ "**",
+      Padj < 0.05   ~ "*",
+      TRUE          ~ ""
+    )
+  )
+
+ggplot(hm_df, aes(x = soil_label, y = cover_label, fill = rho)) +
+  geom_tile(colour = "white", linewidth = 0.5) +
+  geom_text(aes(label = sig_label), size = 4, vjust = 0.8, colour = "grey10") +
+  scale_fill_gradient2(
+    low      = "#d73027",
+    mid      = "white",
+    high     = "#1a9850",
+    midpoint = 0,
+    limits   = c(-1, 1),
+    name     = "Spearman \u03c1"
+  ) +
+  scale_x_discrete(position = "top") +
+  labs(
+    x       = NULL, y = NULL,
+    caption = "Stars indicate BH-FDR significance: *** p<0.001, ** p<0.01, * p<0.05"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.x      = element_text(angle = 35, hjust = 0, size = 10),
+    axis.text.y      = element_text(size = 10),
+    legend.position  = "right",
+    panel.grid       = element_blank()
+  )
+```
+
+```{r cover-soil-scatter, fig.width = 11, fig.height = 3.5 * ceiling(nrow(sig_pairs) / 3), warning = FALSE}
+# ── Scatter plots for significant pairs only ──────────────────────────────────
+if (nrow(sig_pairs) == 0) {
+  cat("No significant cover × soil pairs at Padj < 0.05.\n")
+} else {
+  scatter_plots <- lapply(seq_len(nrow(sig_pairs)), function(i) {
+    cv  <- sig_pairs$cover_var[[i]]
+    sv  <- sig_pairs$soil_var[[i]]
+    rho <- sig_pairs$rho[[i]]
+    pad <- sig_pairs$Padj[[i]]
+    lbl <- paste0(
+      "\u03c1 = ", formatC(rho, digits = 2, format = "f"),
+      sig_stars(pad),
+      "\nPadj = ", fmt_p(pad)
+    )
+
+    d <- plot_meta %>%
+      select(Location, Moraine,
+             x = all_of(sv), y = all_of(cv)) %>%
+      filter(!is.na(x), !is.na(y)) %>%
+      mutate(Moraine = factor(Moraine, levels = c("A", "B", "C")))
+
+    ggplot(d, aes(x = x, y = y)) +
+      geom_smooth(
+        method = "lm", formula = y ~ x, colour = "grey40",
+        fill = "grey80", linewidth = 0.7, alpha = 0.25, na.rm = TRUE
+      ) +
+      geom_point(
+        aes(fill = Moraine, shape = Location),
+        size = 2.8, colour = "white", stroke = 0.5
+      ) +
+      annotate(
+        "text", x = -Inf, y = Inf, label = lbl,
+        hjust = -0.08, vjust = 1.4, size = 2.9, colour = "grey20"
+      ) +
+      scale_fill_manual(values = moraine_colours, guide = "none") +
+      scale_shape_manual(values = location_shapes, guide = "none") +
+      labs(
+        x = soil_labels[[sv]],
+        y = cover_labels[[cv]]
+      ) +
+      theme_bw(base_size = 10) +
+      theme(panel.grid.minor = element_blank())
+  })
+
+  # Shared legend (extract from one plot with legends shown)
+  legend_plot <- ggplot(
+    plot_meta %>%
+      mutate(Moraine = factor(Moraine, levels = c("A", "B", "C"))),
+    aes(x = 1, y = 1, fill = Moraine, shape = Location)
+  ) +
+    geom_point(size = 3, colour = "white", stroke = 0.5) +
+    scale_fill_manual(
+      values = moraine_colours, name = "Moraine age",
+      labels = moraine_labels
+    ) +
+    scale_shape_manual(values = location_shapes, name = "Location") +
+    guides(
+      fill  = guide_legend(override.aes = list(shape = 21, size = 3)),
+      shape = guide_legend(override.aes = list(fill = "grey60", size = 3))
+    ) +
+    theme_void()
+
+  wrap_plots(scatter_plots, ncol = 3) +
+    plot_layout(guides = "collect") &
+    theme(legend.position = "bottom")
+}
+```
+
+## Spearman correlation heatmaps — cover, soil, and environment
+
+Three cross-block Spearman heatmaps:
+
+1. **Cover × soil**
+2. **Cover × topography / environmental** (distance, moraine age, elevation, slope, TPI, aspect, snow)
+3. **Soil × topography / environmental**
+
+Benjamini–Hochberg FDR is applied **within each heatmap** (across that block's unique pairs).
+
+```{r cross-block-spearman-setup}
+env_corr_vars <- c(
+  "DistanceFromGlacier",
+  "Moraine_num",
+  setdiff(env_vars, "DistanceFromGlacier")
+)
+
+env_corr_labels <- c(
+  DistanceFromGlacier = env_labels[["DistanceFromGlacier"]],
+  Moraine_num         = "Moraine age (Young=1, Old=3)",
+  env_labels[setdiff(env_vars, "DistanceFromGlacier")]
+)
+
+compute_cross_spearman <- function(df, vars_row, vars_col) {
+  bind_rows(lapply(vars_row, function(v_row) {
+    bind_rows(lapply(vars_col, function(v_col) {
+      x <- as.numeric(df[[v_row]])
+      y <- as.numeric(df[[v_col]])
+      ok <- complete.cases(x, y)
+      if (sum(ok) < 5L) {
+        return(tibble(
+          var_row = v_row,
+          var_col = v_col,
+          rho = NA_real_,
+          p_sp = NA_real_
+        ))
+      }
+      ct <- tryCatch(
+        cor.test(x[ok], y[ok], method = "spearman", exact = FALSE),
+        error = function(e) NULL
+      )
+      if (is.null(ct)) {
+        return(tibble(
+          var_row = v_row,
+          var_col = v_col,
+          rho = NA_real_,
+          p_sp = NA_real_
+        ))
+      }
+      tibble(
+        var_row = v_row,
+        var_col = v_col,
+        rho = unname(ct$estimate),
+        p_sp = ct$p.value
+      )
+    }))
+  })) %>%
+    mutate(Padj = p.adjust(p_sp, method = "BH"))
+}
+
+annotate_cross_cor <- function(cor_df, vars_row, vars_col, row_labels, col_labels) {
+  cor_df %>%
+    mutate(
+      row_label = factor(
+        unname(row_labels[var_row]),
+        levels = rev(unname(row_labels[vars_row]))
+      ),
+      col_label = factor(
+        unname(col_labels[var_col]),
+        levels = unname(col_labels[vars_col])
+      ),
+      sig_label = case_when(
+        is.na(Padj)  ~ "",
+        Padj < 0.001 ~ "***",
+        Padj < 0.01  ~ "**",
+        Padj < 0.05  ~ "*",
+        TRUE         ~ ""
+      )
+    )
+}
+
+make_cross_spearman_heatmap <- function(
+    hm_df,
+    title,
+    subtitle,
+    x_lab = NULL,
+    y_lab = NULL
+) {
+  ggplot(hm_df, aes(x = col_label, y = row_label, fill = rho)) +
+    geom_tile(colour = "white", linewidth = 0.5) +
+    geom_text(aes(label = sig_label), size = 3.5, vjust = 0.8, colour = "grey10") +
+    scale_fill_gradient2(
+      low = "#d73027",
+      mid = "white",
+      high = "#1a9850",
+      midpoint = 0,
+      limits = c(-1, 1),
+      name = "Spearman \u03c1",
+      na.value = "grey95"
+    ) +
+    scale_x_discrete(position = "top") +
+    labs(
+      title = title,
+      subtitle = subtitle,
+      x = x_lab,
+      y = y_lab,
+      caption = "Stars: *** Padj < 0.001, ** Padj < 0.01, * Padj < 0.05 (BH-FDR within heatmap)."
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      axis.text.x = element_text(angle = 35, hjust = 0, size = 9),
+      axis.text.y = element_text(size = 9),
+      panel.grid = element_blank(),
+      legend.position = "right"
+    )
+}
+
+cover_soil_cor_block <- compute_cross_spearman(plot_meta, cover_vars, soil_vars) %>%
+  annotate_cross_cor(cover_vars, soil_vars, cover_labels, soil_labels)
+
+cover_env_cor_block <- compute_cross_spearman(plot_meta, cover_vars, env_corr_vars) %>%
+  annotate_cross_cor(cover_vars, env_corr_vars, cover_labels, env_corr_labels)
+
+soil_env_cor_block <- compute_cross_spearman(plot_meta, soil_vars, env_corr_vars) %>%
+  annotate_cross_cor(soil_vars, env_corr_vars, soil_labels, env_corr_labels)
+
+cross_block_cor_all <- bind_rows(
+  cover_soil_cor_block %>% mutate(block = "Cover x Soil"),
+  cover_env_cor_block %>% mutate(block = "Cover x Environment"),
+  soil_env_cor_block %>% mutate(block = "Soil x Environment")
+) %>%
+  mutate(
+    row_label = case_when(
+      block == "Cover x Soil" ~ cover_labels[var_row],
+      block == "Cover x Environment" ~ cover_labels[var_row],
+      block == "Soil x Environment" ~ soil_labels[var_row]
+    ),
+    col_label = case_when(
+      block == "Cover x Soil" ~ soil_labels[var_col],
+      block == "Cover x Environment" ~ env_corr_labels[var_col],
+      block == "Soil x Environment" ~ env_corr_labels[var_col]
+    ),
+    sig_label = case_when(
+      is.na(Padj)  ~ "",
+      Padj < 0.001 ~ "***",
+      Padj < 0.01  ~ "**",
+      Padj < 0.05  ~ "*",
+      TRUE         ~ ""
+    )
+  )
+
+cat("Cover x soil pairs:", nrow(cover_soil_cor_block),
+    "| sig:", sum(cover_soil_cor_block$Padj < alpha, na.rm = TRUE), "\n")
+cat("Cover x environment pairs:", nrow(cover_env_cor_block),
+    "| sig:", sum(cover_env_cor_block$Padj < alpha, na.rm = TRUE), "\n")
+cat("Soil x environment pairs:", nrow(soil_env_cor_block),
+    "| sig:", sum(soil_env_cor_block$Padj < alpha, na.rm = TRUE), "\n")
+```
+
+### 1. Cover × soil
+
+```{r cover-soil-cross-heatmap, fig.width=10, fig.height=6}
+p_cover_soil_cross_heatmap <- make_cross_spearman_heatmap(
+  cover_soil_cor_block,
+  title = "Cover × soil — Spearman correlations",
+  subtitle = paste0(
+    "BH-FDR across ", nrow(cover_soil_cor_block), " cover × soil pairs."
+  ),
+  x_lab = "Soil property",
+  y_lab = "Cover type"
+)
+
+p_cover_soil_cross_heatmap
+```
+
+### 2. Cover × topography / environmental
+
+```{r cover-env-cross-heatmap, fig.width=10, fig.height=6}
+p_cover_env_cross_heatmap <- make_cross_spearman_heatmap(
+  cover_env_cor_block,
+  title = "Cover × topography / environmental — Spearman correlations",
+  subtitle = paste0(
+    "BH-FDR across ", nrow(cover_env_cor_block),
+    " cover × environmental pairs. Moraine age = ordinal (A=1, B=2, C=3)."
+  ),
+  x_lab = "Topography / environmental variable",
+  y_lab = "Cover type"
+)
+
+p_cover_env_cross_heatmap
+```
+
+### 3. Soil × topography / environmental
+
+```{r soil-env-cross-heatmap, fig.width=10, fig.height=6.5}
+p_soil_env_cross_heatmap <- make_cross_spearman_heatmap(
+  soil_env_cor_block,
+  title = "Soil × topography / environmental — Spearman correlations",
+  subtitle = paste0(
+    "BH-FDR across ", nrow(soil_env_cor_block),
+    " soil × environmental pairs. Moraine age = ordinal (A=1, B=2, C=3)."
+  ),
+  x_lab = "Topography / environmental variable",
+  y_lab = "Soil property"
+)
+
+p_soil_env_cross_heatmap
+```
+
+```{r export-cross-block-spearman-heatmaps, message=FALSE, warning=FALSE}
+cover_fig_dir <- file.path(project_root, "Cover_figures_REVISION")
+dir.create(cover_fig_dir, recursive = TRUE, showWarnings = FALSE)
+
+cross_block_corr_csv <- file.path(
+  cover_fig_dir,
+  "Cross_block_spearman_correlations_REVISION.csv"
+)
+write.csv(cross_block_cor_all, cross_block_corr_csv, row.names = FALSE)
+
+export_cross_heatmap <- function(plot_obj, slug, width, height) {
+  png_file <- file.path(cover_fig_dir, paste0(slug, "_REVISION.png"))
+  svg_file <- file.path(cover_fig_dir, paste0(slug, "_REVISION.svg"))
+  ggsave(png_file, plot = plot_obj, width = width, height = height, dpi = 300, bg = "white")
+  save_gg_svg(svg_file, plot = plot_obj, width = width, height = height)
+  tibble(figure = slug, png = png_file, svg = svg_file)
+}
+
+cross_block_export_index <- bind_rows(
+  export_cross_heatmap(p_cover_soil_cross_heatmap, "Spearman_heatmap_cover_soil", 10, 6),
+  export_cross_heatmap(p_cover_env_cross_heatmap, "Spearman_heatmap_cover_environment", 10, 6),
+  export_cross_heatmap(p_soil_env_cross_heatmap, "Spearman_heatmap_soil_environment", 10, 6.5)
+) %>%
+  mutate(csv = cross_block_corr_csv)
+
+cross_block_export_index %>%
+  kable(caption = "Exported cross-block Spearman heatmaps") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## Structural equation model — environment → colonization → soil
+
+A path model testing the directional chain:
+**environmental gradient → vegetation colonization → soil development**.
+
+With ~20–30 plots, individual-variable SEM is parameter-saturated. Instead:
+
+1. **PCA on cover variables** → PC1 scores as a *vegetation colonisation index*
+   (loadings show which cover types load positively).
+2. **PCA on soil variables** → PC1 scores as a *soil development index*.
+3. **`lavaan` path model** (all variables standardised):
+
+```
+Distance, Elevation, Snow → VegPC1 → SoilPC1
+                          ↘ direct ↗
+```
+
+Standardised path coefficients, *p*-values, and bootstrapped indirect effects are
+reported. Fisher's C test (from a `piecewiseSEM` cross-check) assesses model fit.
+
+```{r sem-setup, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({
+  library(lavaan)
+  library(piecewiseSEM)
+})
+
+# ── Clean variable names for formula use ─────────────────────────────────────
+sem_raw <- plot_meta %>%
+  rename(
+    OM_pct       = `OM%`,
+    TN_pct       = `TN_%`,
+    TP_pct       = `TP_%`,
+    Texture_2mm  = `texture_>2mm`
+  ) %>%
+  select(
+    Plot, Location, Moraine,
+    DistanceFromGlacier, Elevation, Slope, TPI, Aspect_sin, Aspect_cos, Snow_1976,
+    all_of(cover_vars),
+    OM_pct, pH, TN_pct, TP_pct, Na_mg_g, Mg_mg_g, K_mg_g, Ca_mg_g, Texture_2mm
+  ) %>%
+  filter(complete.cases(.))
+
+cat("n plots (complete cases):", nrow(sem_raw), "\n")
+
+# ── PCA — cover (vegetation colonisation index) ───────────────────────────────
+cover_mat <- sem_raw %>%
+  select(all_of(cover_vars)) %>%
+  mutate(across(everything(), as.numeric))
+
+pca_cover <- prcomp(cover_mat, center = TRUE, scale. = TRUE)
+
+cat("\nCover PCA — variance explained:\n")
+print(round(summary(pca_cover)$importance[, 1:4], 3))
+cat("\nCover PC1 loadings:\n")
+print(round(pca_cover$rotation[, 1], 3))
+
+# ── PCA — soil (soil development index) ──────────────────────────────────────
+soil_mat <- sem_raw %>%
+  select(OM_pct, pH, TN_pct, TP_pct, Na_mg_g, Mg_mg_g, K_mg_g, Ca_mg_g, Texture_2mm) %>%
+  mutate(across(everything(), as.numeric))
+
+pca_soil <- prcomp(soil_mat, center = TRUE, scale. = TRUE)
+
+cat("\nSoil PCA — variance explained:\n")
+print(round(summary(pca_soil)$importance[, 1:4], 3))
+cat("\nSoil PC1 loadings:\n")
+print(round(pca_soil$rotation[, 1], 3))
+
+# ── PCA — topography (all env except Distance) ────────────────────────────────
+# Snow_1976 is binary (0/1) but included as numeric for PCA; interpretable as
+# "recently glaciated" axis combined with terrain shape variables.
+topo_vars_pca <- c("Elevation", "Slope", "TPI", "Aspect_sin", "Aspect_cos", "Snow_1976")
+
+topo_mat <- sem_raw %>%
+  select(all_of(topo_vars_pca)) %>%
+  mutate(across(everything(), as.numeric))
+
+pca_topo <- prcomp(topo_mat, center = TRUE, scale. = TRUE)
+
+cat("\nTopography PCA — variance explained:\n")
+print(round(summary(pca_topo)$importance[, 1:4], 3))
+cat("\nTopography PC1 loadings:\n")
+print(round(pca_topo$rotation[, 1], 3))
+
+# ── Microbial genus richness — rarefied, plot-level ───────────────────────────
+suppressPackageStartupMessages({
+  library(phyloseq)
+  library(vegan)
+  library(NetCoMi)
+})
+
+# ── Helper: resolve RDS path ──────────────────────────────────────────────────
+pick_existing_file <- function(candidates, label = "file") {
+  hits <- candidates[file.exists(candidates)]
+  if (length(hits) == 0)
+    stop("Could not find ", label, ". Tried:\n",
+         paste0("  - ", candidates, collapse = "\n"))
+  normalizePath(hits[[1]], winslash = "/", mustWork = FALSE)
+}
+
+# ── Load and glom to genus ────────────────────────────────────────────────────
+load_genus_ps <- function(rds_candidates, label) {
+  ps_raw <- readRDS(pick_existing_file(rds_candidates, label))
+  ps_g   <- phyloseq::tax_glom(ps_raw, taxrank = "Genus")
+  ps_g   <- NetCoMi::renameTaxa(
+    ps_g,
+    pat      = "<name>",
+    substPat = "<name>_<subst_name>(<subst_R>)",
+    numDupli = "Genus"
+  )
+  ps_g
+}
+
+ps_16s_genus <- load_genus_ps(
+  c(file.path(molecular_dir, "ITS", "La_Gla_final_16S_core.Rds"),
+    file.path(molecular_dir, "La_Gla_final_16S_core.Rds")),
+  "16S core phyloseq"
+)
+
+ps_its_genus <- load_genus_ps(
+  c(file.path(molecular_dir, "ITS", "La_Gla_final_ITS_core.Rds"),
+    file.path(molecular_dir, "La_Gla_final_ITS_core.Rds")),
+  "ITS core phyloseq"
+)
+
+# ── Pool samples to plot level, then rarefy iteratively ───────────────────────
+# n_iter rarefaction draws are averaged to remove stochastic noise from a
+# single subsample draw.  Both observed genus richness and Shannon H' are
+# averaged across iterations.
+pool_and_rarefy <- function(ps, plot_col = "Plot", n_iter = 999, seed = 42) {
+  otu  <- as(phyloseq::otu_table(ps), "matrix")
+  if (phyloseq::taxa_are_rows(ps)) otu <- t(otu)   # rows = samples
+  meta <- as(phyloseq::sample_data(ps), "data.frame")
+
+  stopifnot(plot_col %in% colnames(meta))
+
+  plots     <- as.character(meta[[plot_col]])
+  pool      <- rowsum(otu, group = plots)     # sum counts per plot
+  depth     <- rowSums(pool)
+  min_depth <- min(depth)
+  cat("  Pooled reads — min:", min_depth,
+      " | median:", round(median(depth)),
+      " | n plots:", nrow(pool), "\n")
+
+  pool_ok <- pool[depth >= min_depth, , drop = FALSE]
+
+  set.seed(seed)
+  rich_mat <- matrix(NA_real_, nrow = nrow(pool_ok), ncol = n_iter)
+  shan_mat <- matrix(NA_real_, nrow = nrow(pool_ok), ncol = n_iter)
+
+  for (i in seq_len(n_iter)) {
+    rare_i          <- vegan::rrarefy(pool_ok, sample = min_depth)
+    rich_mat[, i]   <- rowSums(rare_i > 0)
+    shan_mat[, i]   <- vegan::diversity(rare_i, index = "shannon")
+  }
+
+  tibble(
+    Plot     = rownames(pool_ok),
+    n_genera = rowMeans(rich_mat),        # mean observed genus richness
+    shannon  = rowMeans(shan_mat)         # mean Shannon H'
+  )
+}
+
+cat("Pooling 16S to plot level — iterative rarefaction (999 draws) ...\n")
+div_16s <- pool_and_rarefy(ps_16s_genus) %>%
+  rename(Rich_16S = n_genera, Shan_16S = shannon)
+
+cat("Pooling ITS to plot level — iterative rarefaction (999 draws) ...\n")
+div_its <- pool_and_rarefy(ps_its_genus) %>%
+  rename(Rich_ITS = n_genera, Shan_ITS = shannon)
+
+rich_raw <- full_join(div_16s, div_its, by = "Plot")
+
+cat("\nDiversity summary (999-draw average):\n")
+cat("16S — median richness:", round(median(rich_raw$Rich_16S, na.rm = TRUE), 1),
+    " | median Shannon:", round(median(rich_raw$Shan_16S, na.rm = TRUE), 3), "\n")
+cat("ITS — median richness:", round(median(rich_raw$Rich_ITS, na.rm = TRUE), 1),
+    " | median Shannon:", round(median(rich_raw$Shan_ITS, na.rm = TRUE), 3), "\n")
+print(rich_raw)
+```
+
+```{r sem-pca-biplots, fig.width=13, fig.height=4.5}
+# ── Generic biplot helper ─────────────────────────────────────────────────────
+biplot_df <- function(pca_obj, score_df) {
+  scores   <- as.data.frame(pca_obj$x[, 1:2])
+  loadings <- as.data.frame(pca_obj$rotation[, 1:2])
+  loadings$Variable <- rownames(loadings)
+  list(scores = bind_cols(score_df, scores), loadings = loadings)
+}
+
+make_biplot <- function(bp, pca_obj, title, var_labels = NULL, scale = 2.5) {
+  pct <- round(summary(pca_obj)$importance[2, 1:2] * 100, 1)
+  labs_fn <- function(v) if (!is.null(var_labels) && v %in% names(var_labels)) var_labels[v] else v
+
+  ggplot(bp$scores, aes(x = PC1, y = PC2)) +
+    geom_hline(yintercept = 0, colour = "grey70", linetype = "dashed") +
+    geom_vline(xintercept = 0, colour = "grey70", linetype = "dashed") +
+    geom_point(aes(fill = Moraine, shape = Location),
+               size = 3, colour = "white", stroke = 0.5) +
+    geom_segment(data = bp$loadings,
+                 aes(x = 0, y = 0, xend = PC1 * scale, yend = PC2 * scale),
+                 arrow = arrow(length = unit(0.18, "cm")),
+                 colour = "#c0392b", linewidth = 0.7) +
+    geom_text(data = bp$loadings %>%
+                mutate(lbl = sapply(Variable, labs_fn)),
+              aes(x = PC1 * (scale + 0.3), y = PC2 * (scale + 0.3), label = lbl),
+              size = 2.8, colour = "#c0392b", fontface = "italic") +
+    scale_fill_manual(
+      values = moraine_colours,
+      labels = moraine_labels,
+      name = "Moraine age"
+    ) +
+    scale_shape_manual(values = location_shapes, name = "Location") +
+    guides(
+      fill = guide_legend(override.aes = list(shape = 21)),
+      shape = guide_legend(override.aes = list(fill = "grey60"))
+    ) +
+    labs(title = paste0(title, " PCA"),
+         x = paste0("PC1 (", pct[1], "%)"),
+         y = paste0("PC2 (", pct[2], "%)")) +
+    theme_bw(base_size = 10) +
+    theme(legend.position = "right", panel.grid.minor = element_blank())
+}
+
+cover_bp <- biplot_df(pca_cover, sem_raw %>% select(Location, Moraine))
+soil_bp  <- biplot_df(pca_soil,  sem_raw %>% select(Location, Moraine))
+topo_bp  <- biplot_df(pca_topo,  sem_raw %>% select(Location, Moraine))
+
+cover_var_labels <- setNames(
+  c("Lichen","Moss","Crust","Forb","Graminoid","Bare soil","Stones"), cover_vars
+)
+soil_var_labels <- c(
+  OM_pct = "OM%", pH = "pH", TN_pct = "TN%", TP_pct = "TP%",
+  Na_mg_g = "Na", Mg_mg_g = "Mg", K_mg_g = "K", Ca_mg_g = "Ca",
+  Texture_2mm = ">2mm"
+)
+topo_var_labels <- c(
+  Elevation  = "Elevation", Slope   = "Slope", TPI       = "TPI",
+  Aspect_sin = "Asp.(sin)", Aspect_cos = "Asp.(cos)", Snow_1976 = "Snow 1976"
+)
+
+make_biplot(cover_bp, pca_cover, "Cover",       cover_var_labels) +
+make_biplot(soil_bp,  pca_soil,  "Soil",        soil_var_labels) +
+make_biplot(topo_bp,  pca_topo,  "Topography",  topo_var_labels) +
+plot_layout(guides = "collect", ncol = 3) &
+  theme(legend.position = "bottom")
+```
+
+### PCA conditioned by location
+
+The same three PCAs repeated separately for **Nubra** and **Tsomoriri** to check
+whether the dominant axes of variation are consistent across locations or driven
+by location-specific gradients.
+
+```{r sem-pca-biplots-location, fig.width=13, fig.height=9, warning=FALSE}
+# ── Run all three PCAs within each location ───────────────────────────────────
+locations <- unique(sem_raw$Location)
+
+# For each location, compute PCAs and collect biplots
+pca_vars <- list(
+  Cover      = list(vars = cover_vars,    labels = cover_var_labels,  scale = 2.5),
+  Soil       = list(vars = c("OM_pct","pH","TN_pct","TP_pct",
+                              "Na_mg_g","Mg_mg_g","K_mg_g","Ca_mg_g",
+                              "Texture_2mm"),
+                    labels = soil_var_labels, scale = 2.5),
+  Topography = list(vars = topo_vars_pca, labels = topo_var_labels,   scale = 2.0)
+)
+
+loc_plots <- lapply(locations, function(loc) {
+  sub <- sem_raw %>% filter(Location == loc)
+
+  lapply(names(pca_vars), function(ptype) {
+    cfg     <- pca_vars[[ptype]]
+    mat     <- sub %>%
+      select(all_of(cfg$vars)) %>%
+      mutate(across(everything(), as.numeric)) %>%
+      # drop columns with zero variance (can't scale them)
+      select(where(~ var(., na.rm = TRUE) > 0))
+
+    if (ncol(mat) < 2 || nrow(mat) < 3) return(NULL)
+
+    pca_loc <- prcomp(mat, center = TRUE, scale. = TRUE)
+    bp_loc  <- biplot_df(pca_loc, sub %>% select(Location, Moraine))
+
+    make_biplot(bp_loc, pca_loc,
+                title      = paste0(ptype, "\n(", loc, ")"),
+                var_labels = cfg$labels,
+                scale      = cfg$scale) +
+      theme(plot.title = element_text(size = 9, face = "bold"))
+  })
+})
+
+# Flatten into a list, removing NULLs
+plot_list <- Filter(Negate(is.null), unlist(loc_plots, recursive = FALSE))
+
+wrap_plots(plot_list, ncol = 3) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "bottom")
+```
+
+### Partial PCA — variation independent of location
+
+The between-location centroid (Nubra vs Tsomoriri mean) is removed as a
+conditioning variable before decomposition: `rda(mat ~ Condition(Location))`.
+The resulting axes (`PC1`, `PC2`) capture only the *within-location* covariance
+structure — i.e. variation shared by both glacier systems after the location
+effect is partialled out. Points are coloured by moraine age; shapes still
+distinguish locations so any residual separation can be seen.
+
+```{r sem-pca-partial, fig.width=13, fig.height=4.5, warning=FALSE, message=FALSE}
+suppressPackageStartupMessages(library(vegan))
+
+# ── Partial RDA variance summary helper ───────────────────────────────────────
+summarise_partial_rda_variance <- function(mat, meta, input_name) {
+  ok_cols <- apply(mat, 2, var, na.rm = TRUE) > 0
+  mat <- mat[, ok_cols, drop = FALSE]
+
+  rda_obj <- vegan::rda(
+    mat ~ Condition(Location),
+    data = meta,
+    scale = TRUE
+  )
+
+  total_inertia <- rda_obj$tot.chi
+  conditioned_inertia <- if (is.null(rda_obj$pCCA)) {
+    0
+  } else {
+    rda_obj$pCCA$tot.chi
+  }
+  residual_inertia <- rda_obj$CA$tot.chi
+
+  residual_eigenvalues <- vegan::eigenvals(
+    rda_obj,
+    model = "unconstrained"
+  )
+  residual_axis_pct <- residual_eigenvalues /
+    sum(residual_eigenvalues) * 100
+
+  tibble(
+    PCA_input = input_name,
+    n_variables = ncol(mat),
+    total_inertia = total_inertia,
+    conditioned_inertia = conditioned_inertia,
+    variation_conditioned_by_location_pct =
+      conditioned_inertia / total_inertia * 100,
+    residual_inertia = residual_inertia,
+    residual_variation_pct = residual_inertia / total_inertia * 100,
+    PC1_pct_of_residual_variation = residual_axis_pct[1],
+    PC2_pct_of_residual_variation = residual_axis_pct[2]
+  )
+}
+
+# ── Partial RDA biplot helper ─────────────────────────────────────────────────
+make_partial_biplot <- function(mat, meta, title, var_labels = NULL,
+                                scale = 2.0) {
+
+  # Drop zero-variance columns
+  ok_cols <- apply(mat, 2, var, na.rm = TRUE) > 0
+  mat     <- mat[, ok_cols, drop = FALSE]
+
+  # Partial RDA: condition on Location
+  rda_obj <- vegan::rda(mat ~ Condition(Location), data = meta,
+                         scale = TRUE)
+
+  # Variance explained by each residual PC
+  ev      <- eigenvals(rda_obj, model = "unconstrained")
+  pct_ev  <- round(ev / sum(ev) * 100, 1)
+
+  # Site scores (one row per plot)
+  sites   <- as.data.frame(scores(rda_obj, display = "sites",
+                                   choices = 1:2, scaling = 2))
+  sites$Location <- meta$Location
+  sites$Moraine  <- meta$Moraine
+
+  # Species loadings
+  sp      <- as.data.frame(scores(rda_obj, display = "species",
+                                   choices = 1:2, scaling = 2))
+  sp$Variable <- rownames(sp)
+
+  labs_fn <- function(v)
+    if (!is.null(var_labels) && v %in% names(var_labels)) var_labels[[v]] else v
+
+  ggplot(sites, aes(x = PC1, y = PC2)) +
+    geom_hline(yintercept = 0, colour = "grey70", linetype = "dashed") +
+    geom_vline(xintercept = 0, colour = "grey70", linetype = "dashed") +
+    geom_point(aes(fill = Moraine, shape = Location),
+               size = 3.5, colour = "white", stroke = 0.5) +
+    geom_segment(data = sp,
+                 aes(x = 0, y = 0, xend = PC1 * scale, yend = PC2 * scale),
+                 arrow = arrow(length = unit(0.18, "cm")),
+                 colour = "#c0392b", linewidth = 0.7) +
+    geom_text(data = sp %>%
+                mutate(lbl = sapply(Variable, labs_fn)),
+              aes(x = PC1 * (scale + 0.3), y = PC2 * (scale + 0.3),
+                  label = lbl),
+              size = 2.8, colour = "#c0392b", fontface = "italic") +
+    scale_fill_manual(
+      values = moraine_colours,
+      labels = moraine_labels,
+      name   = "Moraine age"
+    ) +
+    scale_shape_manual(values = location_shapes, name = "Location") +
+    guides(
+      fill = guide_legend(override.aes = list(shape = 21)),
+      shape = guide_legend(override.aes = list(fill = "grey60"))
+    ) +
+    labs(title = paste0(title, "\n(partial PCA | Location conditioned out)"),
+         x = paste0("PC1 (", pct_ev[1], "% of residual var.)"),
+         y = paste0("PC2 (", pct_ev[2], "% of residual var.)")) +
+    theme_bw(base_size = 10) +
+    theme(legend.position = "right", panel.grid.minor = element_blank(),
+          plot.title = element_text(size = 9, face = "bold"))
+}
+
+# ── Prepare numeric matrices (same rows as sem_raw) ───────────────────────────
+cover_mat_all <- sem_raw %>%
+  select(all_of(cover_vars)) %>%
+  mutate(across(everything(), as.numeric))
+
+soil_mat_all  <- sem_raw %>%
+  select(OM_pct, pH, TN_pct, TP_pct,
+         Na_mg_g, Mg_mg_g, K_mg_g, Ca_mg_g, Texture_2mm) %>%
+  mutate(across(everything(), as.numeric))
+
+topo_mat_all  <- sem_raw %>%
+  select(all_of(topo_vars_pca)) %>%
+  mutate(across(everything(), as.numeric))
+
+meta_all <- sem_raw %>% select(Location, Moraine)
+
+partial_pca_variance_summary <- bind_rows(
+  summarise_partial_rda_variance(
+    cover_mat_all, meta_all, "Vegetation cover"
+  ),
+  summarise_partial_rda_variance(
+    soil_mat_all, meta_all, "Soil"
+  ),
+  summarise_partial_rda_variance(
+    topo_mat_all, meta_all, "Topography"
+  )
+)
+
+partial_pca_variance_summary %>%
+  mutate(
+    across(
+      c(
+        total_inertia,
+        conditioned_inertia,
+        residual_inertia
+      ),
+      ~ round(.x, 3)
+    ),
+    across(
+      c(
+        variation_conditioned_by_location_pct,
+        residual_variation_pct,
+        PC1_pct_of_residual_variation,
+        PC2_pct_of_residual_variation
+      ),
+      ~ round(.x, 1)
+    )
+  ) %>%
+  rename(
+    `PCA input` = PCA_input,
+    `Variables (n)` = n_variables,
+    `Total inertia` = total_inertia,
+    `Conditioned inertia` = conditioned_inertia,
+    `Conditioned by Location (%)` =
+      variation_conditioned_by_location_pct,
+    `Residual inertia` = residual_inertia,
+    `Residual variation (%)` = residual_variation_pct,
+    `PC1 (% residual)` = PC1_pct_of_residual_variation,
+    `PC2 (% residual)` = PC2_pct_of_residual_variation
+  ) %>%
+  kable(
+    caption = paste(
+      "Location-conditioned partial RDA variance partitioning.",
+      "PC1 and PC2 percentages are relative to residual variation"
+    )
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover"),
+    full_width = FALSE
+  )
+
+p_partial_pca_biplots <- make_partial_biplot(cover_mat_all, meta_all, "Cover",      cover_var_labels) +
+  make_partial_biplot(soil_mat_all,  meta_all, "Soil",       soil_var_labels)  +
+  make_partial_biplot(topo_mat_all,  meta_all, "Topography", topo_var_labels)  +
+  plot_layout(guides = "collect", ncol = 3) &
+  theme(legend.position = "bottom")
+
+p_partial_pca_biplots
+```
+
+```{r export-partial-pca-biplots, message=FALSE, warning=FALSE}
+partial_pca_fig_dir <- file.path(molecular_dir, "SEM_figures_REVISION")
+dir.create(partial_pca_fig_dir, recursive = TRUE, showWarnings = FALSE)
+
+partial_pca_png <- file.path(partial_pca_fig_dir, "partial_pca_biplots_REVISION.png")
+partial_pca_svg <- file.path(partial_pca_fig_dir, "partial_pca_biplots_REVISION.svg")
+
+ggsave(
+  filename = partial_pca_png,
+  plot = p_partial_pca_biplots,
+  width = 13,
+  height = 4.5,
+  dpi = 300,
+  bg = "white"
+)
+
+save_gg_svg(
+  filename = partial_pca_svg,
+  plot = p_partial_pca_biplots,
+  width = 13,
+  height = 4.5
+)
+
+partial_pca_export_index <- tibble(
+  figure = "partial_pca_biplots",
+  description = "Location-conditioned partial PCA biplots for cover, soil, and topography SEM inputs",
+  png = partial_pca_png,
+  svg = partial_pca_svg
+)
+
+write.csv(
+  partial_pca_export_index,
+  file.path(partial_pca_fig_dir, "Partial_PCA_biplots_index_REVISION.csv"),
+  row.names = FALSE
+)
+
+partial_pca_export_index %>%
+  kable(caption = "Exported partial PCA biplots") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r sem-fit, message=FALSE, warning=FALSE}
+# ── Assemble core SEM data ────────────────────────────────────────────────────
+# TopoPC1 = first PC of Elevation, Slope, TPI, Aspect_sin/cos, Snow_1976.
+# All composites and continuous env vars are z-scored for comparability.
+sem_data <- sem_raw %>%
+  mutate(
+    VegPC1   = as.numeric(scale(pca_cover$x[, 1])),
+    SoilPC1  = as.numeric(scale(pca_soil$x[, 1])),
+    TopoPC1  = as.numeric(scale(pca_topo$x[, 1])),
+    Dist_z   = as.numeric(scale(DistanceFromGlacier))
+  )
+
+# ── Core lavaan path model: Distance + TopoPC1 -> Veg -> Soil ────────────────
+sem_model <- '
+  # Tier 1: env -> vegetation colonisation
+  VegPC1  ~ a1*Dist_z + a2*TopoPC1
+
+  # Tier 2: veg -> soil + direct env effects on soil
+  SoilPC1 ~ b*VegPC1 + c1*Dist_z + c2*TopoPC1
+
+  # Indirect effects (env -> veg -> soil)
+  ind_dist := a1 * b
+  ind_topo := a2 * b
+
+  # Total effects on soil
+  tot_dist := a1 * b + c1
+  tot_topo := a2 * b + c2
+'
+
+sem_fit <- sem(
+  sem_model,
+  data      = sem_data,
+  estimator = "ML",
+  se        = "bootstrap",
+  bootstrap = 1000
+)
+
+fit_idx <- fitMeasures(sem_fit, c("chisq", "df", "pvalue", "cfi", "rmsea", "srmr"))
+cat("Core model fit:\n"); print(round(fit_idx, 3))
+cat("\nR-squared:\n"); print(lavInspect(sem_fit, "r2"))
+```
+
+```{r sem-tables}
+# ── Shared helper: format parameterEstimates into a clean tibble ──────────────
+fmt_params <- function(fit) {
+  parameterEstimates(fit, standardized = TRUE, boot.ci.type = "bca.simple") %>%
+    as_tibble() %>%
+    filter(op %in% c("~", ":=")) %>%
+    mutate(
+      Type     = if_else(op == ":=", "Indirect/Total", "Direct"),
+      std_beta = round(std.all, 3),
+      SE       = round(se,      3),
+      CI_lo    = round(ci.lower, 3),
+      CI_hi    = round(ci.upper, 3),
+      p_val    = round(pvalue,  4),
+      Sig      = sig_stars(pvalue)
+    )
+}
+
+core_labels <- c(
+  Dist_z  = "Distance from glacier (z)",
+  TopoPC1 = "Topo. PCA1 (z)",
+  VegPC1  = "Veg. colonisation PC1",
+  SoilPC1 = "Soil development PC1"
+)
+ind_labels_core <- c(
+  ind_dist = "Distance -> Veg -> Soil (indirect)",
+  ind_topo = "TopoPC1  -> Veg -> Soil (indirect)",
+  tot_dist = "Distance -> Soil (total)",
+  tot_topo = "TopoPC1  -> Soil (total)"
+)
+
+param_core <- fmt_params(sem_fit)
+
+# Direct paths
+direct_core <- param_core %>%
+  filter(Type == "Direct") %>%
+  mutate(
+    Response  = dplyr::recode(rhs, !!!core_labels),
+    Predictor = dplyr::recode(lhs, !!!core_labels)
+  ) %>%
+  select(Response, Predictor, `Beta (std)` = std_beta, SE,
+         `95% CI lo` = CI_lo, `95% CI hi` = CI_hi, p = p_val, ` ` = Sig)
+
+nv <- sum(direct_core$Response == core_labels["VegPC1"])
+ns <- sum(direct_core$Response == core_labels["SoilPC1"])
+
+direct_core %>%
+  kable(caption = paste0(
+    "Core SEM direct paths (std. beta; 1000-rep bootstrap BCA CI). ",
+    "TopoPC1 = PC1 of Elevation, Slope, TPI, Aspect sin/cos, Snow 1976 (all z-scored)."
+  )) %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE) %>%
+  pack_rows("-> Veg. colonisation PC1", 1,      nv) %>%
+  pack_rows("-> Soil development PC1",  nv + 1, nv + ns)
+
+# Indirect & total effects
+param_core %>%
+  filter(Type == "Indirect/Total") %>%
+  mutate(Effect = dplyr::recode(lhs, !!!ind_labels_core)) %>%
+  select(Effect, `Beta (std)` = std_beta, SE,
+         `95% CI lo` = CI_lo, `95% CI hi` = CI_hi, p = p_val, ` ` = Sig) %>%
+  kable(caption = "Core SEM indirect and total effects") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE) %>%
+  pack_rows("Indirect (env -> veg -> soil)", 1, 2) %>%
+  pack_rows("Total (direct + indirect)",     3, 4)
+```
+
+```{r sem-path-diagram, fig.width = 8, fig.height = 4.5}
+paths <- parameterEstimates(sem_fit, standardized = TRUE) %>%
+  filter(op == "~") %>%
+  mutate(std_beta = round(std.all, 2), sig = pvalue < alpha)
+
+# 4-node layout: 2 env inputs | VegPC1 | SoilPC1
+nodes <- tribble(
+  ~node,      ~x,    ~y,    ~label,                              ~type,
+  "Dist_z",    0.00,  0.72,  "Distance\nfrom glacier (z)",        "env",
+  "TopoPC1",   0.00,  0.28,  "Topography\nPC1 (z)",              "env",
+  "VegPC1",    0.50,  0.50,  "Vegetation\ncolonisation\n(PC1)",   "composite",
+  "SoilPC1",   1.00,  0.50,  "Soil\ndevelopment\n(PC1)",          "composite"
+)
+
+draw_sem_diagram <- function(paths_df, nodes_df, node_w = 0.30, node_h = 0.12,
+                             txt_size = 3.2, edge_frac = 0.55) {
+  if (!"show_label" %in% names(paths_df)) {
+    paths_df$show_label <- paths_df$sig
+  }
+  if (!"label_sig" %in% names(paths_df)) {
+    paths_df$label_sig <- paths_df$sig
+  }
+
+  edges_df <- paths_df %>%
+    left_join(nodes_df %>% select(lhs = node, x0 = x, y0 = y), by = "lhs") %>%
+    left_join(nodes_df %>% select(rhs = node, x1 = x, y1 = y), by = "rhs") %>%
+    filter(!is.na(x0), !is.na(x1)) %>%
+    mutate(
+      alpha = if_else(sig, 1.0, 0.22),
+      lwd   = pmax(abs(std_beta) * 2.8 + 0.3, 0.4),
+      lbl_x = x0 + (x1 - x0) * edge_frac,
+      lbl_y = y0 + (y1 - y0) * edge_frac,
+      lbl   = if_else(show_label, paste0(std_beta, if_else(label_sig, "*", "")), "")
+    )
+
+  nfill <- c(env = "#dbeafe", composite = "#fef3c7", outcome = "#d1fae5")
+  nbord <- c(env = "#2563eb", composite = "#d97706", outcome = "#059669")
+  nodes_c <- nodes_df %>%
+    mutate(fill_c = nfill[type], bord_c = nbord[type])
+
+  ggplot() +
+    geom_segment(
+      data = edges_df %>% filter(std_beta >= 0),
+      aes(x = x0, y = y0, xend = x1, yend = y1, linewidth = lwd, alpha = alpha),
+      colour = "#1a9850",
+      arrow = arrow(length = unit(0.2, "cm"), type = "closed"),
+      show.legend = FALSE
+    ) +
+    geom_segment(
+      data = edges_df %>% filter(std_beta < 0),
+      aes(x = x0, y = y0, xend = x1, yend = y1, linewidth = lwd, alpha = alpha),
+      colour = "#d73027",
+      arrow = arrow(length = unit(0.2, "cm"), type = "closed"),
+      show.legend = FALSE
+    ) +
+    geom_label(
+      data = edges_df %>% filter(show_label),
+      aes(x = lbl_x, y = lbl_y, label = lbl),
+      size = txt_size - 0.5, label.padding = unit(0.1, "lines"),
+      label.size = 0, fill = "white", colour = "grey15"
+    ) +
+    geom_tile(
+      data = nodes_c,
+      aes(x = x, y = y, fill = fill_c, colour = bord_c),
+      width = node_w, height = node_h, linewidth = 0.8, show.legend = FALSE
+    ) +
+    geom_text(
+      data = nodes_c,
+      aes(x = x, y = y, label = label),
+      size = txt_size, lineheight = 0.85
+    ) +
+    scale_fill_identity() +
+    scale_colour_identity() +
+    scale_linewidth_identity() +
+    scale_alpha_identity() +
+    labs(caption = paste0(
+      "Blue = env inputs; amber = PCA composites; green = microbial outcomes.\n",
+      "Green arrow = positive, red = negative path. ",
+      "Faded = ns (p >= 0.05). Values = std. beta (* p < 0.05)."
+    )) +
+    theme_void(base_size = 11) +
+    theme(plot.caption = element_text(hjust = 0.5, size = 8, colour = "grey40",
+                                      lineheight = 1.3))
+}
+
+draw_sem_diagram(paths, nodes,
+                 node_w = 0.32, node_h = 0.13) +
+  coord_cartesian(xlim = c(-0.22, 1.22), ylim = c(0.05, 0.95), clip = "off")
+```
+
+## Extended SEM — Microbial richness as terminal outcomes
+
+Vegetation and soil development are hypothesised to drive microbial community
+richness (measured as the number of co-occurrence network nodes per plot; source:
+`network_n_taxa_by_plot_REVISION.csv`, `Treatment == "all"`). The core model is
+extended by adding Bacterial (16S) and Fungal (ITS) richness as terminal outcomes,
+allowing both mediated (env → veg → soil → richness) and direct paths.
+
+```{r sem-richness-setup}
+# ── Join iteratively-rarefied diversity metrics to sem_data ───────────────────
+# rich_raw contains: Plot, Rich_16S, Shan_16S, Rich_ITS, Shan_ITS
+# All four metrics are z-scored for SEM comparability.
+sem_data_rich <- sem_data %>%
+  left_join(rich_raw, by = "Plot") %>%
+  mutate(
+    Rich16S = as.numeric(scale(Rich_16S)),
+    RichITS = as.numeric(scale(Rich_ITS)),
+    Shan16S = as.numeric(scale(Shan_16S)),
+    ShanITS = as.numeric(scale(Shan_ITS))
+  ) %>%
+  filter(!is.na(Rich16S), !is.na(RichITS))
+
+cat("n plots with diversity data:", nrow(sem_data_rich), "\n\n")
+cat("Observed genus richness (999-draw mean):\n")
+cat("  16S — range:", round(range(sem_data_rich$Rich_16S, na.rm = TRUE), 1),
+    " | median:", round(median(sem_data_rich$Rich_16S, na.rm = TRUE), 1), "\n")
+cat("  ITS — range:", round(range(sem_data_rich$Rich_ITS, na.rm = TRUE), 1),
+    " | median:", round(median(sem_data_rich$Rich_ITS, na.rm = TRUE), 1), "\n\n")
+cat("Shannon H' (999-draw mean):\n")
+cat("  16S — range:", round(range(sem_data_rich$Shan_16S, na.rm = TRUE), 3),
+    " | median:", round(median(sem_data_rich$Shan_16S, na.rm = TRUE), 3), "\n")
+cat("  ITS — range:", round(range(sem_data_rich$Shan_ITS, na.rm = TRUE), 3),
+    " | median:", round(median(sem_data_rich$Shan_ITS, na.rm = TRUE), 3), "\n")
+```
+
+### Microbial richness and Shannon diversity along the glacier retreat gradient — raw values
+
+Raw plot-level microbial diversity metrics (999-rarefaction mean) plotted against
+distance from glacier for bacteria (16S) and fungi (ITS). Straight linear trend
+lines with 95% confidence intervals summarize direction; panel annotations report
+Spearman correlations and FDR-adjusted *p*-values.
+
+```{r microbial-distance-raw-plots, fig.width = 11, fig.height = 8}
+microbial_diversity_labels <- c(
+  Rich_16S = "Bacterial richness",
+  Rich_ITS = "Fungal richness",
+  Shan_16S = "Bacterial Shannon H'",
+  Shan_ITS = "Fungal Shannon H'"
+)
+
+microbial_distance_raw <- plot_meta %>%
+  select(Plot, Location, Moraine, DistanceFromGlacier) %>%
+  left_join(rich_raw, by = "Plot") %>%
+  pivot_longer(
+    cols      = all_of(names(microbial_diversity_labels)),
+    names_to  = "diversity_metric",
+    values_to = "diversity_value"
+  ) %>%
+  mutate(
+    diversity_label = microbial_diversity_labels[diversity_metric],
+    diversity_label = factor(diversity_label, levels = microbial_diversity_labels),
+    Moraine = factor(Moraine, levels = c("A", "B", "C")),
+    Location = factor(Location)
+  )
+
+microbial_distance_sp <- microbial_distance_raw %>%
+  group_by(diversity_metric, diversity_label) %>%
+  group_modify(~ {
+    ok <- complete.cases(.x$DistanceFromGlacier, .x$diversity_value)
+    if (sum(ok) < 5) {
+      return(tibble(rho = NA_real_, p_sp = NA_real_))
+    }
+    ct <- cor.test(
+      .x$DistanceFromGlacier[ok],
+      .x$diversity_value[ok],
+      method = "spearman",
+      exact = FALSE
+    )
+    tibble(rho = unname(ct$estimate), p_sp = ct$p.value)
+  }) %>%
+  ungroup() %>%
+  mutate(
+    Padj_sp = p.adjust(p_sp, method = "BH"),
+    label = paste0(
+      "\u03c1 = ", formatC(rho, digits = 2, format = "f"),
+      sig_stars(Padj_sp),
+      "\nPadj = ", fmt_p(Padj_sp)
+    )
+  )
+
+p_microbial_distance_raw <- ggplot(
+  microbial_distance_raw,
+  aes(x = DistanceFromGlacier, y = diversity_value)
+) +
+  geom_smooth(
+    method = "lm", formula = y ~ x,
+    colour = "grey30", fill = "grey80", linewidth = 0.8, alpha = 0.3,
+    na.rm = TRUE
+  ) +
+  geom_point(
+    aes(fill = Moraine, shape = Location),
+    size = 3, colour = "white", stroke = 0.6, na.rm = TRUE
+  ) +
+  geom_text(
+    data = microbial_distance_sp,
+    aes(label = label),
+    x = -Inf, y = Inf,
+    hjust = -0.08, vjust = 1.3,
+    size = 3, colour = "grey20", inherit.aes = FALSE
+  ) +
+  facet_wrap(~ diversity_label, ncol = 2, scales = "free_y") +
+  scale_fill_manual(
+    values = moraine_colours, name = "Moraine age",
+    labels = moraine_labels
+  ) +
+  scale_shape_manual(values = location_shapes, name = "Location") +
+  guides(
+    fill  = guide_legend(override.aes = list(shape = 21, size = 3.5)),
+    shape = guide_legend(override.aes = list(fill = "grey60", size = 3.5))
+  ) +
+  labs(
+    x = "Distance from glacier (m)",
+    y = "Raw microbial diversity value"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    strip.background = element_rect(fill = "grey92"),
+    strip.text       = element_text(face = "bold", size = 10),
+    legend.position  = "bottom",
+    legend.box       = "horizontal",
+    panel.grid.minor = element_blank()
+  )
+
+p_microbial_distance_raw
+```
+
+```{r export-microbial-diversity-distance-figure, message=FALSE, warning=FALSE}
+cover_fig_dir <- file.path(project_root, "Cover_figures_REVISION")
+dir.create(cover_fig_dir, recursive = TRUE, showWarnings = FALSE)
+
+microbial_distance_png <- file.path(
+  cover_fig_dir,
+  "microbial_diversity_distance_raw_REVISION.png"
+)
+microbial_distance_svg <- file.path(
+  cover_fig_dir,
+  "microbial_diversity_distance_raw_REVISION.svg"
+)
+
+ggsave(
+  filename = microbial_distance_png,
+  plot = p_microbial_distance_raw,
+  width = 11,
+  height = 8,
+  dpi = 300,
+  bg = "white"
+)
+
+save_gg_svg(
+  filename = microbial_distance_svg,
+  plot = p_microbial_distance_raw,
+  width = 11,
+  height = 8
+)
+
+microbial_export_index <- tibble(
+  figure = "microbial_diversity_distance_raw",
+  description = "Raw bacterial/fungal richness and Shannon diversity vs distance from glacier",
+  png = microbial_distance_png,
+  svg = microbial_distance_svg
+)
+
+write.csv(
+  microbial_export_index,
+  file.path(cover_fig_dir, "Microbial_diversity_smoothed_figures_index_REVISION.csv"),
+  row.names = FALSE
+)
+
+if (exists("cover_soil_export_index")) {
+  bind_rows(cover_soil_export_index, microbial_export_index) %>%
+    write.csv(
+      file.path(cover_fig_dir, "Cover_soil_microbe_smoothed_figures_index_REVISION.csv"),
+      row.names = FALSE
+    )
+}
+
+microbial_export_index %>%
+  kable(caption = "Exported smoothed microbial diversity figure") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r sem-richness-fit, message=FALSE, warning=FALSE}
+sem_model_rich <- '
+  # Tier 1: env -> vegetation colonisation
+  VegPC1  ~ a1*Dist_z + a2*TopoPC1
+
+  # Tier 2: veg -> soil + direct env effects on soil
+  SoilPC1 ~ b*VegPC1 + c1*Dist_z + c2*TopoPC1
+
+  # Tier 3: microbial richness as terminal outcomes
+  # Parsimonious model: environment affects richness through vegetation/soil.
+  Rich16S ~ d1*VegPC1 + d2*SoilPC1
+  RichITS ~ f1*VegPC1 + f2*SoilPC1
+
+  # Correlated residuals — 16S and ITS share unmeasured environmental drivers
+  Rich16S ~~ RichITS
+
+  # ── Key indirect effects ──────────────────────────────────────────────────
+  # Env -> Soil via Veg
+  ind_dist_veg_soil  := a1 * b
+  ind_topo_veg_soil  := a2 * b
+
+  # Veg -> richness (direct)  vs via Soil
+  ind_veg_soil_16s   := b  * d2
+  ind_veg_soil_its   := b  * f2
+
+  # Env -> 16S via Veg and soil-mediated pathways
+  ind_dist_veg_16s   := a1 * d1
+  ind_dist_soil_16s  := (a1*b + c1) * d2
+  ind_topo_veg_16s   := a2 * d1
+  ind_topo_soil_16s  := (a2*b + c2) * d2
+
+  # Env -> ITS via Veg and soil-mediated pathways
+  ind_dist_veg_its   := a1 * f1
+  ind_dist_soil_its  := (a1*b + c1) * f2
+  ind_topo_veg_its   := a2 * f1
+  ind_topo_soil_its  := (a2*b + c2) * f2
+'
+
+sem_rich <- sem(
+  sem_model_rich,
+  data      = sem_data_rich,
+  estimator = "ML",
+  se        = "bootstrap",
+  bootstrap = 1000
+)
+
+fit_rich <- fitMeasures(sem_rich, c("chisq", "df", "pvalue", "cfi", "rmsea", "srmr"))
+cat("Extended model fit:\n"); print(round(fit_rich, 3))
+cat("\nR-squared:\n"); print(lavInspect(sem_rich, "r2"))
+```
+
+```{r sem-richness-tables}
+rich_node_labels <- c(
+  Dist_z   = "Distance (z)",
+  TopoPC1  = "TopoPC1 (z)",
+  VegPC1   = "Veg. colonisation PC1",
+  SoilPC1  = "Soil development PC1",
+  Rich16S  = "Bacterial richness (z)",
+  RichITS  = "Fungal richness (z)"
+)
+
+param_rich <- fmt_params(sem_rich)
+
+# Direct paths table
+direct_rich <- param_rich %>%
+  filter(Type == "Direct") %>%
+  mutate(
+    Response  = dplyr::recode(rhs, !!!rich_node_labels),
+    Predictor = dplyr::recode(lhs, !!!rich_node_labels)
+  ) %>%
+  select(Response, Predictor, `Beta (std)` = std_beta, SE,
+         `95% CI lo` = CI_lo, `95% CI hi` = CI_hi, p = p_val, ` ` = Sig)
+
+row_groups <- direct_rich %>%
+  mutate(.rn = row_number()) %>%
+  group_by(Response) %>%
+  summarise(start = min(.rn), end = max(.rn), .groups = "drop") %>%
+  arrange(start)
+
+tbl <- direct_rich %>%
+  kable(caption = paste0(
+    "Extended SEM direct paths. Bacterial/Fungal richness = network node count ",
+    "(z-scored). Bootstrap SE & 95% BCA CI (1000 reps)."
+  )) %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+
+for (i in seq_len(nrow(row_groups))) {
+  tbl <- tbl %>% pack_rows(
+    paste0("-> ", row_groups$Response[i]),
+    row_groups$start[i], row_groups$end[i]
+  )
+}
+tbl
+
+# Indirect effects table
+ind_labels_rich <- c(
+  ind_dist_veg_soil  = "Distance -> Veg -> Soil",
+  ind_topo_veg_soil  = "TopoPC1  -> Veg -> Soil",
+  ind_veg_soil_16s   = "Veg -> Soil -> Bacteria",
+  ind_veg_soil_its   = "Veg -> Soil -> Fungi",
+  ind_dist_veg_16s   = "Distance -> Veg -> Bacteria",
+  ind_dist_soil_16s  = "Distance -> Soil -> Bacteria",
+  ind_topo_veg_16s   = "TopoPC1  -> Veg -> Bacteria",
+  ind_topo_soil_16s  = "TopoPC1  -> Soil -> Bacteria",
+  ind_dist_veg_its   = "Distance -> Veg -> Fungi",
+  ind_dist_soil_its  = "Distance -> Soil -> Fungi",
+  ind_topo_veg_its   = "TopoPC1  -> Veg -> Fungi",
+  ind_topo_soil_its  = "TopoPC1  -> Soil -> Fungi"
+)
+
+param_rich %>%
+  filter(Type == "Indirect/Total") %>%
+  mutate(Effect = dplyr::recode(lhs, !!!ind_labels_rich)) %>%
+  select(Effect, `Beta (std)` = std_beta, SE,
+         `95% CI lo` = CI_lo, `95% CI hi` = CI_hi, p = p_val, ` ` = Sig) %>%
+  kable(caption = "Extended SEM: key indirect effects") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE) %>%
+  pack_rows("Env -> Soil via Veg",          1,  2) %>%
+  pack_rows("Veg -> Richness via Soil",      3,  4) %>%
+  pack_rows("Env -> Bacteria (mediated)",    5,  8) %>%
+  pack_rows("Env -> Fungi (mediated)",       9, 12)
+```
+
+```{r sem-richness-diagram, fig.width = 10, fig.height = 5.5}
+paths_rich <- parameterEstimates(sem_rich, standardized = TRUE) %>%
+  filter(op == "~") %>%
+  mutate(std_beta = round(std.all, 2), sig = pvalue < alpha)
+
+# 6-node layout: env left | composites centre | richness right
+nodes_rich <- tribble(
+  ~node,     ~x,    ~y,    ~label,                             ~type,
+  "Dist_z",   0.00,  0.72,  "Distance\nfrom glacier (z)",       "env",
+  "TopoPC1",  0.00,  0.28,  "Topography\nPC1 (z)",             "env",
+  "VegPC1",   0.40,  0.72,  "Vegetation\ncolonisation\n(PC1)", "composite",
+  "SoilPC1",  0.40,  0.28,  "Soil\ndevelopment\n(PC1)",        "composite",
+  "Rich16S",  0.85,  0.72,  "Bacterial\nrichness",             "outcome",
+  "RichITS",  0.85,  0.28,  "Fungal\nrichness",                "outcome"
+)
+
+draw_sem_diagram(paths_rich, nodes_rich,
+                 node_w = 0.30, node_h = 0.12, txt_size = 3.0, edge_frac = 0.52) +
+  coord_cartesian(xlim = c(-0.22, 1.08), ylim = c(0.05, 0.95), clip = "off")
+```
+
+```{r sem-richness-bacterial-trimmed-diagram, fig.width = 9, fig.height = 4.8}
+# Main trimmed microbial SEM: bacterial richness as the terminal outcome.
+# This focuses the figure on the hypothesised environment -> vegetation -> soil
+# -> bacterial richness pathway, while retaining direct env -> soil paths.
+paths_rich_bact <- paths_rich %>%
+  filter(.data$lhs %in% c("VegPC1", "SoilPC1", "Rich16S"))
+
+nodes_rich_bact <- tribble(
+  ~node,     ~x,    ~y,    ~label,                             ~type,
+  "Dist_z",   0.00,  0.72,  "Distance\nfrom glacier (z)",       "env",
+  "TopoPC1",  0.00,  0.28,  "Topography\nPC1 (z)",             "env",
+  "VegPC1",   0.40,  0.72,  "Vegetation\ncolonisation\n(PC1)", "composite",
+  "SoilPC1",  0.40,  0.28,  "Soil\ndevelopment\n(PC1)",        "composite",
+  "Rich16S",  0.85,  0.50,  "Bacterial\nrichness",             "outcome"
+)
+
+draw_sem_diagram(paths_rich_bact, nodes_rich_bact,
+                 node_w = 0.30, node_h = 0.12,
+                 txt_size = 3.0, edge_frac = 0.52) +
+  coord_cartesian(xlim = c(-0.22, 1.08), ylim = c(0.05, 0.95), clip = "off") +
+  labs(subtitle = "Trimmed SEM — observed bacterial genus richness")
+```
+
+## Extended SEM — Shannon diversity as terminal outcomes
+
+The same model structure as above but using **Shannon H'** (evenness-weighted
+diversity) in place of observed genus richness.  Shannon responds differently
+from raw richness when dominant genera shift along the succession — compare the
+two to distinguish richness gain from evenness restructuring.
+
+```{r sem-shannon-fit, message=FALSE, warning=FALSE}
+sem_model_shan <- '
+  # Tier 1: env -> vegetation colonisation
+  VegPC1  ~ a1*Dist_z + a2*TopoPC1
+
+  # Tier 2: veg -> soil + direct env effects
+  SoilPC1 ~ b*VegPC1 + c1*Dist_z + c2*TopoPC1
+
+  # Tier 3: Shannon diversity as terminal outcomes
+  # Parsimonious model: environment affects diversity through vegetation/soil.
+  Shan16S ~ d1*VegPC1 + d2*SoilPC1
+  ShanITS ~ f1*VegPC1 + f2*SoilPC1
+
+  # Correlated residuals
+  Shan16S ~~ ShanITS
+
+  # Indirect effects
+  ind_dist_veg_soil  := a1 * b
+  ind_topo_veg_soil  := a2 * b
+  ind_veg_soil_16s   := b  * d2
+  ind_veg_soil_its   := b  * f2
+  ind_dist_veg_16s   := a1 * d1
+  ind_dist_soil_16s  := (a1*b + c1) * d2
+  ind_topo_veg_16s   := a2 * d1
+  ind_topo_soil_16s  := (a2*b + c2) * d2
+  ind_dist_veg_its   := a1 * f1
+  ind_dist_soil_its  := (a1*b + c1) * f2
+  ind_topo_veg_its   := a2 * f1
+  ind_topo_soil_its  := (a2*b + c2) * f2
+'
+
+sem_shan <- sem(
+  sem_model_shan,
+  data      = sem_data_rich,
+  estimator = "ML",
+  se        = "bootstrap",
+  bootstrap = 1000
+)
+
+fit_shan <- fitMeasures(sem_shan, c("chisq", "df", "pvalue", "cfi", "rmsea", "srmr"))
+cat("Shannon model fit:\n"); print(round(fit_shan, 3))
+cat("\nR-squared:\n"); print(lavInspect(sem_shan, "r2"))
+```
+
+```{r sem-shannon-tables}
+shan_node_labels <- c(
+  Dist_z  = "Distance (z)",
+  TopoPC1 = "TopoPC1 (z)",
+  VegPC1  = "Veg. colonisation PC1",
+  SoilPC1 = "Soil development PC1",
+  Shan16S = "Bacterial Shannon H' (z)",
+  ShanITS = "Fungal Shannon H' (z)"
+)
+
+ind_labels_shan <- c(
+  ind_dist_veg_soil  = "Distance -> Veg -> Soil",
+  ind_topo_veg_soil  = "TopoPC1  -> Veg -> Soil",
+  ind_veg_soil_16s   = "Veg -> Soil -> Bacteria H'",
+  ind_veg_soil_its   = "Veg -> Soil -> Fungi H'",
+  ind_dist_veg_16s   = "Distance -> Veg -> Bacteria H'",
+  ind_dist_soil_16s  = "Distance -> Soil -> Bacteria H'",
+  ind_topo_veg_16s   = "TopoPC1  -> Veg -> Bacteria H'",
+  ind_topo_soil_16s  = "TopoPC1  -> Soil -> Bacteria H'",
+  ind_dist_veg_its   = "Distance -> Veg -> Fungi H'",
+  ind_dist_soil_its  = "Distance -> Soil -> Fungi H'",
+  ind_topo_veg_its   = "TopoPC1  -> Veg -> Fungi H'",
+  ind_topo_soil_its  = "TopoPC1  -> Soil -> Fungi H'"
+)
+
+param_shan <- fmt_params(sem_shan)
+
+# Direct paths
+direct_shan <- param_shan %>%
+  filter(Type == "Direct") %>%
+  mutate(
+    Response  = dplyr::recode(rhs, !!!shan_node_labels),
+    Predictor = dplyr::recode(lhs, !!!shan_node_labels)
+  ) %>%
+  select(Response, Predictor, `Beta (std)` = std_beta, SE,
+         `95% CI lo` = CI_lo, `95% CI hi` = CI_hi, p = p_val, ` ` = Sig)
+
+rg_shan <- direct_shan %>%
+  mutate(.rn = row_number()) %>%
+  group_by(Response) %>%
+  summarise(start = min(.rn), end = max(.rn), .groups = "drop") %>%
+  arrange(start)
+
+tbl_shan <- direct_shan %>%
+  kable(caption = paste0(
+    "Shannon H' SEM direct paths (std. beta; 1000-rep bootstrap BCA CI). ",
+    "Diversity metrics averaged over 999 rarefaction draws."
+  )) %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+
+for (i in seq_len(nrow(rg_shan))) {
+  tbl_shan <- tbl_shan %>%
+    pack_rows(paste0("-> ", rg_shan$Response[i]),
+              rg_shan$start[i], rg_shan$end[i])
+}
+tbl_shan
+
+# Indirect effects
+param_shan %>%
+  filter(Type == "Indirect/Total") %>%
+  mutate(Effect = dplyr::recode(lhs, !!!ind_labels_shan)) %>%
+  select(Effect, `Beta (std)` = std_beta, SE,
+         `95% CI lo` = CI_lo, `95% CI hi` = CI_hi, p = p_val, ` ` = Sig) %>%
+  kable(caption = "Shannon H' SEM: indirect effects") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE) %>%
+  pack_rows("Env -> Soil via Veg",        1,  2) %>%
+  pack_rows("Veg -> Diversity via Soil",  3,  4) %>%
+  pack_rows("Env -> Bacteria H'",         5,  8) %>%
+  pack_rows("Env -> Fungi H'",            9, 12)
+```
+
+```{r sem-shannon-diagram, fig.width = 10, fig.height = 5.5}
+paths_shan <- parameterEstimates(sem_shan, standardized = TRUE) %>%
+  filter(op == "~") %>%
+  mutate(std_beta = round(std.all, 2), sig = pvalue < alpha)
+
+nodes_shan <- tribble(
+  ~node,     ~x,    ~y,    ~label,                             ~type,
+  "Dist_z",   0.00,  0.72,  "Distance\nfrom glacier (z)",       "env",
+  "TopoPC1",  0.00,  0.28,  "Topography\nPC1 (z)",             "env",
+  "VegPC1",   0.40,  0.72,  "Vegetation\ncolonisation\n(PC1)", "composite",
+  "SoilPC1",  0.40,  0.28,  "Soil\ndevelopment\n(PC1)",        "composite",
+  "Shan16S",  0.85,  0.72,  "Bacterial\nShannon H'",           "outcome",
+  "ShanITS",  0.85,  0.28,  "Fungal\nShannon H'",              "outcome"
+)
+
+draw_sem_diagram(paths_shan, nodes_shan,
+                 node_w = 0.30, node_h = 0.12, txt_size = 3.0, edge_frac = 0.52) +
+  coord_cartesian(xlim = c(-0.22, 1.08), ylim = c(0.05, 0.95), clip = "off")
+```
+
+---
+
+## SEM sensitivity analyses
+
+The core and richness/Shannon SEMs above use **global PCA scores** (all plots
+together), so the composite axes absorb between-location variance.
+Two alternative specifications are tested here:
+
+1. **Partial PCA scores** — location centroid removed from all three composites
+   before SEM; focuses on within-location succession gradients.
+2. **Global PCA + Location** — global scores retained but Location is added as
+   an explicit binary predictor in every equation, letting the model estimate
+   how much location *per se* explains after accounting for Distance and TopoPC1.
+
+Core model only (4-node: Dist + Topo → Veg → Soil) is used for the sensitivity
+analyses to keep degrees of freedom manageable.
+
+### Spec 1 — Partial PCA scores
+
+```{r sem-sens-partial-setup, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages(library(vegan))
+
+# ── Partial RDA site scores (residuals after removing Location means) ─────────
+# scaling = 1 returns distance-biplot scores (site scores in units of
+# sqrt(eigenvalue)); we z-score afterwards for comparability.
+run_partial_rda <- function(mat, meta) {
+  ok_cols <- apply(mat, 2, var, na.rm = TRUE) > 0
+  mat     <- mat[, ok_cols, drop = FALSE]
+  vegan::rda(mat ~ Condition(Location), data = meta, scale = TRUE)
+}
+
+meta_sem <- sem_raw %>% select(Location, Moraine)
+
+rda_cover <- run_partial_rda(
+  sem_raw %>% select(all_of(cover_vars)) %>% mutate(across(everything(), as.numeric)),
+  meta_sem
+)
+rda_soil  <- run_partial_rda(
+  sem_raw %>% select(OM_pct, pH, TN_pct, TP_pct,
+                     Na_mg_g, Mg_mg_g, K_mg_g, Ca_mg_g, Texture_2mm) %>%
+    mutate(across(everything(), as.numeric)),
+  meta_sem
+)
+rda_topo  <- run_partial_rda(
+  sem_raw %>% select(all_of(topo_vars_pca)) %>% mutate(across(everything(), as.numeric)),
+  meta_sem
+)
+
+# Extract PC1 site scores; align sign with global PC1 (flip if r < 0)
+align_sign <- function(partial_scores, global_scores) {
+  if (cor(partial_scores, global_scores, use = "complete.obs") < 0)
+    -partial_scores else partial_scores
+}
+
+pc1_cover_partial <- scores(rda_cover, display = "sites", choices = 1, scaling = 1)[, 1]
+pc1_soil_partial  <- scores(rda_soil,  display = "sites", choices = 1, scaling = 1)[, 1]
+pc1_topo_partial  <- scores(rda_topo,  display = "sites", choices = 1, scaling = 1)[, 1]
+
+sem_data_partial <- sem_raw %>%
+  mutate(
+    VegPC1  = as.numeric(scale(align_sign(pc1_cover_partial, pca_cover$x[, 1]))),
+    SoilPC1 = as.numeric(scale(align_sign(pc1_soil_partial,  pca_soil$x[, 1]))),
+    TopoPC1 = as.numeric(scale(align_sign(pc1_topo_partial,  pca_topo$x[, 1]))),
+    Dist_z  = as.numeric(scale(DistanceFromGlacier))
+  )
+
+cat("Partial RDA variance explained by Location:\n")
+cat("  Cover:", round(RsquareAdj(rda_cover)$r.squared * 100, 1), "%\n")
+cat("  Soil: ", round(RsquareAdj(rda_soil)$r.squared  * 100, 1), "%\n")
+cat("  Topo: ", round(RsquareAdj(rda_topo)$r.squared  * 100, 1), "%\n")
+```
+
+```{r sem-sens-partial-fit, message=FALSE, warning=FALSE}
+sem_partial <- sem(
+  sem_model,          # same 4-node model string defined in sem-fit
+  data      = sem_data_partial,
+  estimator = "ML",
+  se        = "bootstrap",
+  bootstrap = 1000
+)
+
+fit_partial <- fitMeasures(sem_partial, c("chisq","df","pvalue","cfi","rmsea","srmr"))
+cat("Partial PCA SEM fit:\n"); print(round(fit_partial, 3))
+cat("\nR-squared:\n"); print(lavInspect(sem_partial, "r2"))
+```
+
+```{r sem-sens-partial-tables}
+param_part <- fmt_params(sem_partial)
+
+direct_part <- param_part %>%
+  filter(Type == "Direct") %>%
+  mutate(
+    Response  = dplyr::recode(rhs, !!!core_labels),
+    Predictor = dplyr::recode(lhs, !!!core_labels)
+  ) %>%
+  select(Response, Predictor, `Beta (std)` = std_beta, SE,
+         `95% CI lo` = CI_lo, `95% CI hi` = CI_hi, p = p_val, ` ` = Sig)
+
+nv_p <- sum(direct_part$Response == core_labels["VegPC1"])
+ns_p <- sum(direct_part$Response == core_labels["SoilPC1"])
+
+direct_part %>%
+  kable(caption = paste0(
+    "Spec 1 (partial PCA) — direct paths. ",
+    "Composites are PC1 residuals after removing Location means (partial RDA). ",
+    "Signs aligned with global PC1 direction."
+  )) %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE) %>%
+  pack_rows("-> Veg. colonisation PC1 (partial)", 1,         nv_p) %>%
+  pack_rows("-> Soil development PC1 (partial)",  nv_p + 1,  nv_p + ns_p)
+
+param_part %>%
+  filter(Type == "Indirect/Total") %>%
+  mutate(Effect = dplyr::recode(lhs, !!!ind_labels_core)) %>%
+  select(Effect, `Beta (std)` = std_beta, SE,
+         `95% CI lo` = CI_lo, `95% CI hi` = CI_hi, p = p_val, ` ` = Sig) %>%
+  kable(caption = "Spec 1 (partial PCA) — indirect and total effects") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE) %>%
+  pack_rows("Indirect (env -> veg -> soil)", 1, 2) %>%
+  pack_rows("Total (direct + indirect)",     3, 4)
+```
+
+```{r sem-sens-partial-diagram, fig.width=8, fig.height=4.5}
+paths_part  <- parameterEstimates(sem_partial, standardized = TRUE) %>%
+  filter(op == "~") %>%
+  mutate(std_beta = round(std.all, 2), sig = pvalue < alpha)
+
+nodes_part <- tribble(
+  ~node,     ~x,    ~y,    ~label,                                    ~type,
+  "Dist_z",   0.00,  0.72,  "Distance\nfrom glacier (z)",              "env",
+  "TopoPC1",  0.00,  0.28,  "Topography\nPC1 — partial (z)",          "env",
+  "VegPC1",   0.50,  0.72,  "Vegetation\ncolonisation\nPC1 (partial)", "composite",
+  "SoilPC1",  1.00,  0.50,  "Soil\ndevelopment\nPC1 (partial)",        "composite"
+)
+
+draw_sem_diagram(paths_part, nodes_part,
+                 node_w = 0.32, node_h = 0.13) +
+  coord_cartesian(xlim = c(-0.22, 1.22), ylim = c(0.12, 0.88), clip = "off") +
+  labs(subtitle = "Spec 1: partial PCA scores (location centroid removed)")
+```
+
+#### Spec 1 — Microbial richness (partial PCA)
+
+```{r sem-sens-partial-rich-setup}
+sem_data_partial_rich <- sem_data_partial %>%
+  left_join(rich_raw, by = "Plot") %>%
+  mutate(
+    Rich16S = as.numeric(scale(Rich_16S)),
+    RichITS = as.numeric(scale(Rich_ITS)),
+    Shan16S = as.numeric(scale(Shan_16S)),
+    ShanITS = as.numeric(scale(Shan_ITS))
+  ) %>%
+  filter(!is.na(Rich16S), !is.na(RichITS))
+
+cat("n plots (partial PCA + richness):", nrow(sem_data_partial_rich), "\n")
+```
+
+```{r sem-sens-partial-rich-fit, message=FALSE, warning=FALSE}
+# Reuse sem_model_rich — same structure, partial PCA scores as composites
+sem_partial_rich <- sem(
+  sem_model_rich,
+  data      = sem_data_partial_rich,
+  estimator = "ML",
+  se        = "bootstrap",
+  bootstrap = 1000
+)
+
+fit_pr <- fitMeasures(sem_partial_rich, c("chisq","df","pvalue","cfi","rmsea","srmr"))
+cat("Spec 1 richness model fit:\n"); print(round(fit_pr, 3))
+cat("\nR-squared:\n"); print(lavInspect(sem_partial_rich, "r2"))
+```
+
+```{r sem-sens-partial-rich-trim-fit, message=FALSE, warning=FALSE}
+# Final microbial richness SEM:
+# start from Spec 1 (partial PCA) and retain only direct pathways with p <= 0.10.
+trim_alpha <- 0.10
+
+partial_rich_direct_full <- parameterEstimates(sem_partial_rich, standardized = TRUE) %>%
+  as_tibble() %>%
+  filter(.data$op == "~") %>%
+  mutate(
+    keep_path = !is.na(.data$pvalue) & .data$pvalue <= trim_alpha,
+    label_use = if_else(!is.na(.data$label) & nzchar(.data$label), .data$label, "")
+  )
+
+partial_rich_direct_keep <- partial_rich_direct_full %>%
+  filter(.data$keep_path)
+
+if (!nrow(partial_rich_direct_keep)) {
+  stop("No Spec 1 richness direct pathways retained at p <= ", trim_alpha)
+}
+
+trimmed_direct_lines <- partial_rich_direct_keep %>%
+  mutate(
+    path_line = if_else(
+      nzchar(.data$label_use),
+      paste(.data$lhs, "~", paste0(.data$label_use, "*", .data$rhs)),
+      paste(.data$lhs, "~", .data$rhs)
+    )
+  ) %>%
+  pull(path_line)
+
+sem_model_partial_rich_trim <- paste(
+  "# Direct paths retained from full Spec 1 richness SEM at p <= 0.10",
+  paste(trimmed_direct_lines, collapse = "\n"),
+  "",
+  "# Retain shared marker-level residual covariance",
+  "Rich16S ~~ RichITS",
+  sep = "\n"
+)
+
+cat("Trimmed Spec 1 richness model syntax:\n")
+cat(sem_model_partial_rich_trim, "\n")
+
+sem_partial_rich_trim <- sem(
+  sem_model_partial_rich_trim,
+  data      = sem_data_partial_rich,
+  estimator = "ML",
+  se        = "bootstrap",
+  bootstrap = 1000
+)
+
+fit_pr_trim <- fitMeasures(
+  sem_partial_rich_trim,
+  c("chisq", "df", "pvalue", "cfi", "rmsea", "srmr")
+)
+cat("Trimmed Spec 1 richness model fit:\n"); print(round(fit_pr_trim, 3))
+cat("\nR-squared:\n"); print(lavInspect(sem_partial_rich_trim, "r2"))
+```
+
+```{r sem-sens-partial-rich-trim-compare}
+sem_compare_row <- function(fit, model_name, n_paths) {
+  fm <- fitMeasures(fit, c("chisq", "df", "pvalue", "cfi", "rmsea", "srmr"))
+  r2_vals <- lavInspect(fit, "r2")
+  tibble(
+    Model = model_name,
+    `Direct paths` = n_paths,
+    chisq = unname(fm["chisq"]),
+    df = unname(fm["df"]),
+    p = unname(fm["pvalue"]),
+    CFI = unname(fm["cfi"]),
+    RMSEA = unname(fm["rmsea"]),
+    SRMR = unname(fm["srmr"]),
+    AIC = AIC(fit),
+    BIC = BIC(fit),
+    `R2 bacterial richness` = unname(r2_vals["Rich16S"]),
+    `R2 fungal richness` = unname(r2_vals["RichITS"])
+  )
+}
+
+partial_rich_model_compare <- bind_rows(
+  sem_compare_row(
+    sem_partial_rich,
+    "Full Spec 1 richness SEM",
+    sum(partial_rich_direct_full$op == "~")
+  ),
+  sem_compare_row(
+    sem_partial_rich_trim,
+    paste0("Trimmed Spec 1 richness SEM (p <= ", trim_alpha, ")"),
+    nrow(partial_rich_direct_keep)
+  )
+) %>%
+  mutate(
+    across(c(chisq, p, CFI, RMSEA, SRMR, AIC, BIC,
+             `R2 bacterial richness`, `R2 fungal richness`), ~ round(.x, 3))
+  )
+
+partial_rich_model_compare %>%
+  kable(
+    caption = paste0(
+      "Full vs trimmed Spec 1 microbial richness SEM. ",
+      "Trimmed model retains direct pathways with full-model p <= ", trim_alpha, "."
+    )
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+partial_rich_direct_full %>%
+  transmute(
+    Response = dplyr::recode(.data$lhs, !!!rich_node_labels),
+    Predictor = dplyr::recode(.data$rhs, !!!rich_node_labels),
+    `Full-model p` = round(.data$pvalue, 4),
+    `Full-model std. beta` = round(.data$std.all, 3),
+    `Retained in trimmed model` = if_else(.data$keep_path, "yes", "no")
+  ) %>%
+  arrange(Response, `Full-model p`) %>%
+  kable(
+    caption = paste0(
+      "Path-retention audit for trimmed Spec 1 richness SEM ",
+      "(threshold: full-model p <= ", trim_alpha, ")."
+    )
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r sem-sens-partial-rich-trim-tables}
+param_pr_trim <- parameterEstimates(
+  sem_partial_rich_trim,
+  standardized = TRUE,
+  boot.ci.type = "bca.simple"
+) %>%
+  as_tibble() %>%
+  filter(.data$op == "~") %>%
+  mutate(
+    Response  = dplyr::recode(.data$lhs, !!!rich_node_labels),
+    Predictor = dplyr::recode(.data$rhs, !!!rich_node_labels),
+    `Estimate (raw)` = round(.data$est, 3),
+    `Beta (std)` = round(.data$std.all, 3),
+    SE = round(.data$se, 3),
+    `95% CI lo` = round(.data$ci.lower, 3),
+    `95% CI hi` = round(.data$ci.upper, 3),
+    p = round(.data$pvalue, 4),
+    ` ` = sig_stars(.data$pvalue)
+  ) %>%
+  select(
+    Response, Predictor, `Estimate (raw)`, `Beta (std)`, SE,
+    `95% CI lo`, `95% CI hi`, p, ` `
+  ) %>%
+  arrange(Response, Predictor)
+
+rg_pr_trim <- param_pr_trim %>%
+  mutate(.rn = row_number()) %>%
+  group_by(Response) %>%
+  summarise(start = min(.rn), end = max(.rn), .groups = "drop") %>%
+  arrange(start)
+
+tbl_pr_trim <- param_pr_trim %>%
+  kable(
+    caption = paste0(
+      "Final trimmed Spec 1 richness SEM direct paths. ",
+      "Figure labels are `Beta (std)` rounded to two decimals; * indicates p < 0.05."
+    )
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+for (i in seq_len(nrow(rg_pr_trim))) {
+  tbl_pr_trim <- tbl_pr_trim %>%
+    pack_rows(paste0("-> ", rg_pr_trim$Response[i]),
+              rg_pr_trim$start[i], rg_pr_trim$end[i])
+}
+tbl_pr_trim
+```
+
+```{r sem-sens-partial-rich-tables}
+param_pr <- fmt_params(sem_partial_rich)
+
+direct_pr <- param_pr %>%
+  filter(Type == "Direct") %>%
+  mutate(
+    Response  = dplyr::recode(rhs, !!!rich_node_labels),
+    Predictor = dplyr::recode(lhs, !!!rich_node_labels)
+  ) %>%
+  select(Response, Predictor, `Beta (std)` = std_beta, SE,
+         `95% CI lo` = CI_lo, `95% CI hi` = CI_hi, p = p_val, ` ` = Sig)
+
+rg_pr <- direct_pr %>%
+  mutate(.rn = row_number()) %>%
+  group_by(Response) %>%
+  summarise(start = min(.rn), end = max(.rn), .groups = "drop") %>%
+  arrange(start)
+
+tbl_pr <- direct_pr %>%
+  kable(caption = paste0(
+    "Spec 1 (partial PCA) — richness SEM direct paths. ",
+    "Composites are location-conditioned PC1 scores."
+  )) %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+
+for (i in seq_len(nrow(rg_pr)))
+  tbl_pr <- tbl_pr %>% pack_rows(paste0("-> ", rg_pr$Response[i]),
+                                  rg_pr$start[i], rg_pr$end[i])
+tbl_pr
+
+param_pr %>%
+  filter(Type == "Indirect/Total") %>%
+  mutate(Effect = dplyr::recode(lhs, !!!ind_labels_rich)) %>%
+  select(Effect, `Beta (std)` = std_beta, SE,
+         `95% CI lo` = CI_lo, `95% CI hi` = CI_hi, p = p_val, ` ` = Sig) %>%
+  kable(caption = "Spec 1 richness SEM — indirect effects") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE) %>%
+  pack_rows("Env -> Soil via Veg",        1,  2) %>%
+  pack_rows("Veg -> Richness via Soil",   3,  4) %>%
+  pack_rows("Env -> Bacteria (mediated)", 5,  8) %>%
+  pack_rows("Env -> Fungi (mediated)",    9, 12)
+```
+
+```{r sem-sens-partial-rich-diagram, fig.width=10, fig.height=5.5}
+paths_pr <- parameterEstimates(sem_partial_rich, standardized = TRUE) %>%
+  filter(op == "~") %>%
+  mutate(std_beta = round(std.all, 2), sig = pvalue < alpha)
+
+nodes_pr <- tribble(
+  ~node,     ~x,    ~y,    ~label,                              ~type,
+  "Dist_z",   0.00,  0.72,  "Distance\nfrom glacier (z)",        "env",
+  "TopoPC1",  0.00,  0.28,  "Topography\nPC1 — partial (z)",    "env",
+  "VegPC1",   0.40,  0.72,  "Vegetation\ncolonisation\n(PC1)",  "composite",
+  "SoilPC1",  0.40,  0.28,  "Soil\ndevelopment\n(PC1)",         "composite",
+  "Rich16S",  0.85,  0.72,  "Bacterial\nrichness",              "outcome",
+  "RichITS",  0.85,  0.28,  "Fungal\nrichness",                 "outcome"
+)
+
+draw_sem_diagram(paths_pr, nodes_pr,
+                 node_w = 0.30, node_h = 0.12, txt_size = 3.0, edge_frac = 0.52) +
+  coord_cartesian(xlim = c(-0.22, 1.08), ylim = c(0.05, 0.95), clip = "off") +
+  labs(subtitle = "Spec 1 (partial PCA) — observed genus richness")
+```
+
+```{r sem-sens-partial-rich-trim-diagram, fig.width=10, fig.height=5.5}
+paths_pr_trim <- parameterEstimates(sem_partial_rich_trim, standardized = TRUE) %>%
+  as_tibble() %>%
+  filter(.data$op == "~") %>%
+  mutate(
+    std_beta = round(.data$std.all, 2),
+    sig = .data$pvalue < alpha,
+    show_label = TRUE,
+    label_sig = .data$pvalue < alpha
+  )
+
+nodes_pr_trim <- nodes_pr
+
+draw_sem_diagram(paths_pr_trim, nodes_pr_trim,
+                 node_w = 0.30, node_h = 0.12, txt_size = 3.0, edge_frac = 0.52) +
+  coord_cartesian(xlim = c(-0.22, 1.08), ylim = c(0.05, 0.95), clip = "off") +
+  labs(subtitle = paste0(
+    "Final trimmed Spec 1 richness SEM — retained full-model paths p <= ",
+    trim_alpha
+  ))
+```
+
+#### Spec 1 — Shannon diversity (partial PCA)
+
+```{r sem-sens-partial-shan-fit, message=FALSE, warning=FALSE}
+sem_partial_shan <- sem(
+  sem_model_shan,
+  data      = sem_data_partial_rich,
+  estimator = "ML",
+  se        = "bootstrap",
+  bootstrap = 1000
+)
+
+fit_ps <- fitMeasures(sem_partial_shan, c("chisq","df","pvalue","cfi","rmsea","srmr"))
+cat("Spec 1 Shannon model fit:\n"); print(round(fit_ps, 3))
+cat("\nR-squared:\n"); print(lavInspect(sem_partial_shan, "r2"))
+```
+
+```{r sem-sens-partial-shan-tables}
+param_ps <- fmt_params(sem_partial_shan)
+
+direct_ps <- param_ps %>%
+  filter(Type == "Direct") %>%
+  mutate(
+    Response  = dplyr::recode(rhs, !!!shan_node_labels),
+    Predictor = dplyr::recode(lhs, !!!shan_node_labels)
+  ) %>%
+  select(Response, Predictor, `Beta (std)` = std_beta, SE,
+         `95% CI lo` = CI_lo, `95% CI hi` = CI_hi, p = p_val, ` ` = Sig)
+
+rg_ps <- direct_ps %>%
+  mutate(.rn = row_number()) %>%
+  group_by(Response) %>%
+  summarise(start = min(.rn), end = max(.rn), .groups = "drop") %>%
+  arrange(start)
+
+tbl_ps <- direct_ps %>%
+  kable(caption = paste0(
+    "Spec 1 (partial PCA) — Shannon H' SEM direct paths. ",
+    "Composites are location-conditioned PC1 scores."
+  )) %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+
+for (i in seq_len(nrow(rg_ps)))
+  tbl_ps <- tbl_ps %>% pack_rows(paste0("-> ", rg_ps$Response[i]),
+                                  rg_ps$start[i], rg_ps$end[i])
+tbl_ps
+
+param_ps %>%
+  filter(Type == "Indirect/Total") %>%
+  mutate(Effect = dplyr::recode(lhs, !!!ind_labels_shan)) %>%
+  select(Effect, `Beta (std)` = std_beta, SE,
+         `95% CI lo` = CI_lo, `95% CI hi` = CI_hi, p = p_val, ` ` = Sig) %>%
+  kable(caption = "Spec 1 Shannon SEM — indirect effects") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE) %>%
+  pack_rows("Env -> Soil via Veg",          1,  2) %>%
+  pack_rows("Veg -> Diversity via Soil",    3,  4) %>%
+  pack_rows("Env -> Bacteria H'",           5,  8) %>%
+  pack_rows("Env -> Fungi H'",              9, 12)
+```
+
+```{r sem-sens-partial-shan-diagram, fig.width=10, fig.height=5.5}
+paths_ps <- parameterEstimates(sem_partial_shan, standardized = TRUE) %>%
+  filter(op == "~") %>%
+  mutate(std_beta = round(std.all, 2), sig = pvalue < alpha)
+
+nodes_ps <- tribble(
+  ~node,     ~x,    ~y,    ~label,                              ~type,
+  "Dist_z",   0.00,  0.72,  "Distance\nfrom glacier (z)",        "env",
+  "TopoPC1",  0.00,  0.28,  "Topography\nPC1 — partial (z)",    "env",
+  "VegPC1",   0.40,  0.72,  "Vegetation\ncolonisation\n(PC1)",  "composite",
+  "SoilPC1",  0.40,  0.28,  "Soil\ndevelopment\n(PC1)",         "composite",
+  "Shan16S",  0.85,  0.72,  "Bacterial\nShannon H'",            "outcome",
+  "ShanITS",  0.85,  0.28,  "Fungal\nShannon H'",               "outcome"
+)
+
+draw_sem_diagram(paths_ps, nodes_ps,
+                 node_w = 0.30, node_h = 0.12, txt_size = 3.0, edge_frac = 0.52) +
+  coord_cartesian(xlim = c(-0.22, 1.08), ylim = c(0.05, 0.95), clip = "off") +
+  labs(subtitle = "Spec 1 (partial PCA) — Shannon H' diversity")
+```
+
+### Spec 2 — Global PCA + Location as predictor
+
+```{r sem-sens-loc-setup}
+# Encode Location as a binary dummy: Nubra = 1, Tsomoriri = 0
+sem_data_loc <- sem_data %>%
+  mutate(Loc_bin = as.numeric(Location == "Nubra"))
+
+cat("Location dummy: Nubra =", sum(sem_data_loc$Loc_bin),
+    "| Tsomoriri =", sum(sem_data_loc$Loc_bin == 0), "\n")
+```
+
+```{r sem-sens-loc-fit, message=FALSE, warning=FALSE}
+sem_model_loc <- '
+  # Env + Location -> vegetation
+  VegPC1  ~ a1*Dist_z + a2*TopoPC1 + a3*Loc_bin
+
+  # Veg + Env + Location -> soil
+  SoilPC1 ~ b*VegPC1 + c1*Dist_z + c2*TopoPC1 + c3*Loc_bin
+
+  # Indirect effects
+  ind_dist := a1 * b
+  ind_topo := a2 * b
+  ind_loc  := a3 * b
+
+  # Total effects on soil
+  tot_dist := a1 * b + c1
+  tot_topo := a2 * b + c2
+  tot_loc  := a3 * b + c3
+'
+
+sem_loc <- sem(
+  sem_model_loc,
+  data      = sem_data_loc,
+  estimator = "ML",
+  se        = "bootstrap",
+  bootstrap = 1000
+)
+
+fit_loc <- fitMeasures(sem_loc, c("chisq","df","pvalue","cfi","rmsea","srmr"))
+cat("Global PCA + Location SEM fit:\n"); print(round(fit_loc, 3))
+cat("\nR-squared:\n"); print(lavInspect(sem_loc, "r2"))
+```
+
+```{r sem-sens-loc-tables}
+loc_labels <- c(
+  Dist_z  = "Distance (z)",
+  TopoPC1 = "TopoPC1 (z)",
+  Loc_bin = "Location (Nubra=1)",
+  VegPC1  = "Veg. colonisation PC1",
+  SoilPC1 = "Soil development PC1"
+)
+ind_labels_loc <- c(
+  ind_dist = "Distance -> Veg -> Soil (indirect)",
+  ind_topo = "TopoPC1  -> Veg -> Soil (indirect)",
+  ind_loc  = "Location -> Veg -> Soil (indirect)",
+  tot_dist = "Distance -> Soil (total)",
+  tot_topo = "TopoPC1  -> Soil (total)",
+  tot_loc  = "Location -> Soil (total)"
+)
+
+param_loc <- fmt_params(sem_loc)
+
+direct_loc <- param_loc %>%
+  filter(Type == "Direct") %>%
+  mutate(
+    Response  = dplyr::recode(rhs, !!!loc_labels),
+    Predictor = dplyr::recode(lhs, !!!loc_labels)
+  ) %>%
+  select(Response, Predictor, `Beta (std)` = std_beta, SE,
+         `95% CI lo` = CI_lo, `95% CI hi` = CI_hi, p = p_val, ` ` = Sig)
+
+nv_l <- sum(direct_loc$Response == loc_labels["VegPC1"])
+ns_l <- sum(direct_loc$Response == loc_labels["SoilPC1"])
+
+direct_loc %>%
+  kable(caption = paste0(
+    "Spec 2 (global PCA + Location) — direct paths. ",
+    "Global PCA scores; Location (Nubra=1, Tsomoriri=0) as an exogenous dummy."
+  )) %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE) %>%
+  pack_rows("-> Veg. colonisation PC1", 1,         nv_l) %>%
+  pack_rows("-> Soil development PC1",  nv_l + 1,  nv_l + ns_l)
+
+param_loc %>%
+  filter(Type == "Indirect/Total") %>%
+  mutate(Effect = dplyr::recode(lhs, !!!ind_labels_loc)) %>%
+  select(Effect, `Beta (std)` = std_beta, SE,
+         `95% CI lo` = CI_lo, `95% CI hi` = CI_hi, p = p_val, ` ` = Sig) %>%
+  kable(caption = "Spec 2 (global PCA + Location) — indirect and total effects") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE) %>%
+  pack_rows("Indirect (env/loc -> veg -> soil)", 1, 3) %>%
+  pack_rows("Total (direct + indirect)",         4, 6)
+```
+
+```{r sem-sens-loc-diagram, fig.width=8, fig.height=5}
+paths_loc <- parameterEstimates(sem_loc, standardized = TRUE) %>%
+  filter(op == "~") %>%
+  mutate(std_beta = round(std.all, 2), sig = pvalue < alpha)
+
+nodes_loc <- tribble(
+  ~node,     ~x,    ~y,    ~label,                            ~type,
+  "Dist_z",   0.00,  0.85,  "Distance\nfrom glacier (z)",      "env",
+  "TopoPC1",  0.00,  0.50,  "Topography\nPC1 (z)",            "env",
+  "Loc_bin",  0.00,  0.15,  "Location\n(Nubra = 1)",          "env",
+  "VegPC1",   0.50,  0.68,  "Vegetation\ncolonisation\n(PC1)","composite",
+  "SoilPC1",  1.00,  0.50,  "Soil\ndevelopment\n(PC1)",       "composite"
+)
+
+draw_sem_diagram(paths_loc, nodes_loc,
+                 node_w = 0.30, node_h = 0.12) +
+  coord_cartesian(xlim = c(-0.20, 1.20), ylim = c(0.02, 0.98), clip = "off") +
+  labs(subtitle = "Spec 2: global PCA + Location as explicit predictor")
+```
+
+## Export SEM figures
+
+```{r export-sem-figures, message=FALSE, warning=FALSE}
+sem_fig_dir <- file.path(molecular_dir, "SEM_figures_REVISION")
+dir.create(sem_fig_dir, recursive = TRUE, showWarnings = FALSE)
+
+sem_figures <- list(
+  core_global = list(
+    plot = draw_sem_diagram(paths, nodes, node_w = 0.32, node_h = 0.13) +
+      coord_cartesian(xlim = c(-0.22, 1.22), ylim = c(0.05, 0.95), clip = "off"),
+    width = 8, height = 4.5
+  ),
+  richness_global = list(
+    plot = draw_sem_diagram(paths_rich, nodes_rich,
+                            node_w = 0.30, node_h = 0.12,
+                            txt_size = 3.0, edge_frac = 0.52) +
+      coord_cartesian(xlim = c(-0.22, 1.08), ylim = c(0.05, 0.95), clip = "off"),
+    width = 10, height = 5.5
+  ),
+  richness_bacterial_trimmed = list(
+    plot = draw_sem_diagram(paths_rich_bact, nodes_rich_bact,
+                            node_w = 0.30, node_h = 0.12,
+                            txt_size = 3.0, edge_frac = 0.52) +
+      coord_cartesian(xlim = c(-0.22, 1.08), ylim = c(0.05, 0.95), clip = "off") +
+      labs(subtitle = "Trimmed SEM — observed bacterial genus richness"),
+    width = 9, height = 4.8
+  ),
+  shannon_global = list(
+    plot = draw_sem_diagram(paths_shan, nodes_shan,
+                            node_w = 0.30, node_h = 0.12,
+                            txt_size = 3.0, edge_frac = 0.52) +
+      coord_cartesian(xlim = c(-0.22, 1.08), ylim = c(0.05, 0.95), clip = "off"),
+    width = 10, height = 5.5
+  ),
+  core_partial_pca = list(
+    plot = draw_sem_diagram(paths_part, nodes_part,
+                            node_w = 0.32, node_h = 0.13) +
+      coord_cartesian(xlim = c(-0.22, 1.22), ylim = c(0.12, 0.88), clip = "off") +
+      labs(subtitle = "Spec 1: partial PCA scores (location centroid removed)"),
+    width = 8, height = 4.5
+  ),
+  richness_partial_pca = list(
+    plot = draw_sem_diagram(paths_pr, nodes_pr,
+                            node_w = 0.30, node_h = 0.12,
+                            txt_size = 3.0, edge_frac = 0.52) +
+      coord_cartesian(xlim = c(-0.22, 1.08), ylim = c(0.05, 0.95), clip = "off") +
+      labs(subtitle = "Spec 1 (partial PCA) — observed genus richness"),
+    width = 10, height = 5.5
+  ),
+  richness_partial_pca_trimmed = list(
+    plot = draw_sem_diagram(paths_pr_trim, nodes_pr_trim,
+                            node_w = 0.30, node_h = 0.12,
+                            txt_size = 3.0, edge_frac = 0.52) +
+      coord_cartesian(xlim = c(-0.22, 1.08), ylim = c(0.05, 0.95), clip = "off") +
+      labs(subtitle = paste0(
+        "Final trimmed Spec 1 richness SEM — retained full-model paths p <= ",
+        trim_alpha
+      )),
+    width = 10, height = 5.5
+  ),
+  shannon_partial_pca = list(
+    plot = draw_sem_diagram(paths_ps, nodes_ps,
+                            node_w = 0.30, node_h = 0.12,
+                            txt_size = 3.0, edge_frac = 0.52) +
+      coord_cartesian(xlim = c(-0.22, 1.08), ylim = c(0.05, 0.95), clip = "off") +
+      labs(subtitle = "Spec 1 (partial PCA) — Shannon H' diversity"),
+    width = 10, height = 5.5
+  ),
+  core_global_location = list(
+    plot = draw_sem_diagram(paths_loc, nodes_loc,
+                            node_w = 0.30, node_h = 0.12) +
+      coord_cartesian(xlim = c(-0.20, 1.20), ylim = c(0.02, 0.98), clip = "off") +
+      labs(subtitle = "Spec 2: global PCA + Location as explicit predictor"),
+    width = 8, height = 5
+  )
+)
+
+export_sem_figure <- function(name, fig) {
+  png_file <- file.path(sem_fig_dir, paste0(name, "_REVISION.png"))
+  svg_file <- file.path(sem_fig_dir, paste0(name, "_REVISION.svg"))
+
+  ggsave(
+    filename = png_file,
+    plot = fig$plot,
+    width = fig$width,
+    height = fig$height,
+    dpi = 300,
+    bg = "white"
+  )
+
+  save_gg_svg(
+    filename = svg_file,
+    plot = fig$plot,
+    width = fig$width,
+    height = fig$height
+  )
+
+  tibble(figure = name, png = png_file, svg = svg_file)
+}
+
+sem_export_index <- bind_rows(
+  lapply(names(sem_figures), function(nm) export_sem_figure(nm, sem_figures[[nm]]))
+)
+
+write.csv(
+  sem_export_index,
+  file.path(sem_fig_dir, "SEM_figures_index_REVISION.csv"),
+  row.names = FALSE
+)
+
+sem_export_index %>%
+  kable(caption = "Exported SEM figures") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+---
+
+## Results text
+
+```{r results-helpers, include=FALSE}
+# ── Inline-code helpers ───────────────────────────────────────────────────────
+# Extract a standardised path coefficient from a lavaan fit
+std_beta <- function(fit, lhs_v, rhs_v)
+  round(parameterEstimates(fit, standardized = TRUE) %>%
+          filter(lhs == lhs_v, rhs == rhs_v, op == "~") %>%
+          pull(std.all), 2)
+
+# Extract a p-value
+pval <- function(fit, lhs_v, rhs_v) {
+  p <- parameterEstimates(fit, standardized = TRUE) %>%
+    filter(lhs == lhs_v, rhs == rhs_v, op == "~") %>%
+    pull(pvalue)
+  if (p < 0.001) "< 0.001" else paste0("= ", round(p, 3))
+}
+
+# Extract a defined (indirect/total) effect
+def_est <- function(fit, label_v)
+  round(parameterEstimates(fit, standardized = TRUE) %>%
+          filter(lhs == label_v, op == ":=") %>%
+          pull(std.all), 2)
+
+def_p <- function(fit, label_v) {
+  p <- parameterEstimates(fit, standardized = TRUE) %>%
+    filter(lhs == label_v, op == ":=") %>%
+    pull(pvalue)
+  if (p < 0.001) "< 0.001" else paste0("= ", round(p, 3))
+}
+
+# R-squared for a node
+r2 <- function(fit, node)
+  round(unname(lavInspect(fit, "r2")[node]), 2)
+
+# Fit index — NA-safe (just-identified models return NA for pvalue/chisq)
+fi <- function(fit, index) {
+  val <- suppressWarnings(unname(fitMeasures(fit, index)))
+  if (length(val) == 0 || is.na(val)) return(NA_real_)
+  round(val, 3)
+}
+
+# Display chi-square test safely
+chisq_str <- function(fit) {
+  p <- fi(fit, "pvalue")
+  df_val <- fi(fit, "df")
+  chisq_val <- fi(fit, "chisq")
+  p_str <- if (is.na(p)) "n/a (saturated model, df = 0)" else
+    if (p < 0.001) "< 0.001" else paste0("= ", p)
+  paste0("chisq = ", chisq_val, ", df = ", df_val, ", p ", p_str)
+}
+
+# Fit quality label based on CFI/RMSEA (robust to NA pvalue)
+fit_quality <- function(fit) {
+  df_val <- fi(fit, "df")
+  if (!is.na(df_val) && df_val == 0) {
+    return("saturated")
+  }
+  cfi   <- fi(fit, "cfi")
+  rmsea <- fi(fit, "rmsea")
+  p     <- fi(fit, "pvalue")
+  ok_p  <- is.na(p) || p >= 0.05
+  ok_cfi   <- !is.na(cfi)   && cfi   >= 0.95
+  ok_rmsea <- !is.na(rmsea) && rmsea <= 0.08
+  if (ok_p && ok_cfi && ok_rmsea) "good"
+  else if (ok_p || (ok_cfi && ok_rmsea)) "acceptable"
+  else "marginal"
+}
+
+# PCA % variance for PC1
+pct_var <- function(pca_obj)
+  round(summary(pca_obj)$importance[2, 1] * 100, 1)
+
+# Median rarefied diversity
+med_div <- function(col) round(median(col, na.rm = TRUE), 1)
+```
+
+### SEM results
+
+#### Composite axes
+
+The first principal component of cover variables explained
+`r pct_var(pca_cover)`% of total cover variance (VegPC1), with
+positive loadings on lichen and moss cover and negative loadings on bare soil
+and stone cover, representing a gradient from bare, recently-deglaciated
+substrate to vegetated surfaces.
+The soil development axis (SoilPC1) captured `r pct_var(pca_soil)`% of soil
+variance, with positive loadings on organic matter, nitrogen, and phosphorus.
+The topographic position axis (TopoPC1) explained `r pct_var(pca_topo)`% of
+topographic variance.
+
+Median rarefied bacterial genus richness across plots was
+`r med_div(sem_data_rich$Rich_16S)` genera (bacterial Shannon H':
+`r round(median(sem_data_rich$Shan_16S * sd(rich_raw$Shan_16S, na.rm=TRUE) + mean(rich_raw$Shan_16S, na.rm=TRUE), na.rm=TRUE), 2)`),
+and median fungal genus richness was `r med_div(sem_data_rich$Rich_ITS)` genera
+(richness and Shannon H' averaged across 999 rarefaction draws).
+
+#### Core SEM — environmental drivers of vegetation and soil development
+
+The core path model provided `r fit_quality(sem_fit)` fit to the data
+(`r chisq_str(sem_fit)`;
+CFI = `r fi(sem_fit,"cfi")`;
+RMSEA = `r fi(sem_fit,"rmsea")`;
+SRMR = `r fi(sem_fit,"srmr")`).
+
+Distance from the glacier terminus was a significant predictor of vegetation
+colonisation (VegPC1: β = `r std_beta(sem_fit,"VegPC1","Dist_z")`,
+*p* `r pval(sem_fit,"VegPC1","Dist_z")`), indicating that plots further from
+the active glacier front had greater vegetation cover.
+The topographic position axis (TopoPC1) also contributed to vegetation
+development (β = `r std_beta(sem_fit,"VegPC1","TopoPC1")`,
+*p* `r pval(sem_fit,"VegPC1","TopoPC1")`).
+Together, these environmental predictors explained
+R² = `r r2(sem_fit,"VegPC1")` of variation in VegPC1.
+
+Vegetation colonisation was the strongest predictor of soil development
+(SoilPC1: β = `r std_beta(sem_fit,"SoilPC1","VegPC1")`,
+*p* `r pval(sem_fit,"SoilPC1","VegPC1")`), and the model explained
+R² = `r r2(sem_fit,"SoilPC1")` of SoilPC1 variance.
+The indirect effect of distance on soil development via vegetation was
+β = `r def_est(sem_fit,"ind_dist")` (*p* `r def_p(sem_fit,"ind_dist")`),
+and the total effect of distance on soil was
+β = `r def_est(sem_fit,"tot_dist")` (*p* `r def_p(sem_fit,"tot_dist")`).
+
+#### Microbial richness SEM — global-score reference
+
+The parsimonious microbial richness model showed `r fit_quality(sem_rich)` fit
+(`r chisq_str(sem_rich)`;
+CFI = `r fi(sem_rich,"cfi")`;
+RMSEA = `r fi(sem_rich,"rmsea")`).
+Direct environmental paths to richness were omitted a priori, so distance and
+topography affect microbial richness only through vegetation colonisation and
+soil development.
+
+Bacterial genus richness was significantly predicted by soil development
+(β = `r std_beta(sem_rich,"Rich16S","SoilPC1")`,
+*p* `r pval(sem_rich,"Rich16S","SoilPC1")`), but not by vegetation colonisation
+(β = `r std_beta(sem_rich,"Rich16S","VegPC1")`,
+*p* `r pval(sem_rich,"Rich16S","VegPC1")`).
+The model explained R² = `r r2(sem_rich,"Rich16S")` of bacterial richness
+variance.
+In contrast, fungal genus richness was not significantly predicted by any
+direct vegetation or soil variable in the model (both *p* > 0.05;
+VegPC1: β = `r std_beta(sem_rich,"RichITS","VegPC1")`,
+*p* `r pval(sem_rich,"RichITS","VegPC1")`;
+SoilPC1: β = `r std_beta(sem_rich,"RichITS","SoilPC1")`,
+*p* `r pval(sem_rich,"RichITS","SoilPC1")`),
+with R² = `r r2(sem_rich,"RichITS")`.
+The indirect effect of distance on bacterial richness through vegetation and
+soil was β = `r def_est(sem_rich,"ind_dist_soil_16s")`
+(*p* `r def_p(sem_rich,"ind_dist_soil_16s")`).
+
+#### Final microbial richness SEM — partial PCA, trimmed paths
+
+The final microbial richness SEM used the partial-PCA composite scores
+(location centroid removed from VegPC1, SoilPC1, and TopoPC1) and then removed
+direct pathways with *p* > `r trim_alpha` from the full Spec 1 richness model.
+This retained `r nrow(partial_rich_direct_keep)` of
+`r nrow(partial_rich_direct_full)` direct pathways.
+The trimmed model showed `r fit_quality(sem_partial_rich_trim)` fit
+(`r chisq_str(sem_partial_rich_trim)`;
+CFI = `r fi(sem_partial_rich_trim,"cfi")`;
+RMSEA = `r fi(sem_partial_rich_trim,"rmsea")`;
+SRMR = `r fi(sem_partial_rich_trim,"srmr")`).
+It explained R² = `r r2(sem_partial_rich_trim,"Rich16S")` of bacterial richness
+and R² = `r r2(sem_partial_rich_trim,"RichITS")` of fungal richness.
+
+#### Shannon diversity SEM
+
+The parsimonious Shannon diversity model showed `r fit_quality(sem_shan)` fit
+(`r chisq_str(sem_shan)`;
+CFI = `r fi(sem_shan,"cfi")`;
+RMSEA = `r fi(sem_shan,"rmsea")`).
+As in the richness model, direct environmental paths to Shannon diversity were
+excluded so that topographic and distance effects were evaluated as mediated
+pathways through vegetation and soil.
+Bacterial Shannon H' was predicted by soil development
+(β = `r std_beta(sem_shan,"Shan16S","SoilPC1")`,
+*p* `r pval(sem_shan,"Shan16S","SoilPC1")`),
+consistent with the richness model.
+Fungal Shannon H' was evaluated through direct vegetation and soil paths, plus
+the bootstrapped indirect pathways from distance and TopoPC1.
+The model explained R² = `r r2(sem_shan,"Shan16S")` and
+R² = `r r2(sem_shan,"ShanITS")` of bacterial and fungal Shannon H' variance,
+respectively.
+
+#### Sensitivity analyses
+
+Model specification had little effect on the core succession pathway.
+In the partial PCA specification (location centroid removed from all composites),
+the vegetation → soil relationship remained
+(β = `r std_beta(sem_partial,"SoilPC1","VegPC1")`,
+*p* `r pval(sem_partial,"SoilPC1","VegPC1")`),
+and bacterial richness was again significantly predicted by soil development
+(β = `r std_beta(sem_partial_rich,"Rich16S","SoilPC1")`,
+*p* `r pval(sem_partial_rich,"Rich16S","SoilPC1")`).
+When location was included as an explicit binary predictor (Spec 2), it
+explained additional variance in both VegPC1
+(β = `r std_beta(sem_loc,"VegPC1","Loc_bin")`,
+*p* `r pval(sem_loc,"VegPC1","Loc_bin")`)
+and SoilPC1
+(β = `r std_beta(sem_loc,"SoilPC1","Loc_bin")`,
+*p* `r pval(sem_loc,"SoilPC1","Loc_bin")`),
+indicating that the two glacier systems differ in absolute levels of vegetation
+and soil development beyond what is captured by distance and topographic
+position alone.
+
+---
+
+## Methods text
+
+### Main text (for manuscript)
+
+Cover types (lichen, moss, biological soil crust, forbs, graminoids, bare soil,
+stones), soil properties (organic matter, pH, total nitrogen, total phosphorus,
+Na, Mg, K, Ca, coarse fraction >2 mm), and topographic attributes (elevation,
+slope, TPI, aspect as sin/cos components, snow cover in 1976 as a binary
+proxy for recent deglaciation) were each reduced to a single axis via principal
+component analysis (PCA; `prcomp`, centered and scaled).
+The first PC of cover variables (VegPC1), soil variables (SoilPC1), and
+topographic variables (TopoPC1) served as composite indices of vegetation
+colonisation, soil development, and topographic position, respectively.
+
+Microbial genus richness and Shannon diversity (H') were computed separately
+for bacteria (16S rRNA gene amplicons) and fungi (ITS amplicons).
+Amplicon sequence variants were agglomerated to genus level (`phyloseq::tax_glom`)
+and genus names standardised (`NetCoMi::renameTaxa`).
+Counts from all microhabitat samples within each plot were pooled by summation,
+then rarefied to the minimum pooled read depth observed across plots.
+To minimise stochastic noise inherent in a single rarefaction draw, subsampling
+was repeated 999 times and both richness (observed genera) and Shannon H' were
+averaged across iterations (`vegan::rrarefy`, `vegan::diversity`).
+
+Directional relationships among environmental gradients, vegetation colonisation,
+soil development, and microbial diversity were examined using path analysis
+(structural equation modelling, SEM) implemented in `lavaan` v0.6
+[@Rosseel2012].
+The hypothesised succession pathway was:
+environmental predictors (Distance from glacier terminus; TopoPC1) →
+vegetation colonisation (VegPC1) →
+soil development (SoilPC1) →
+microbial diversity (bacterial and fungal richness; bacterial and fungal Shannon H').
+Direct environmental effects on soil were retained because distance and
+topographic position may influence soil development independently of vegetation.
+Direct environmental effects on microbial richness and Shannon diversity were
+omitted in the primary microbial SEMs, making microbial responses terminal
+outcomes of the vegetation-soil pathway.
+All continuous predictors were z-scored prior to modelling. The final microbial
+richness SEM used partial-PCA composite scores, in which between-location
+centroid shifts were removed before extracting PC1 scores, and was trimmed by
+removing direct pathways with *p* > 0.10 from the full partial-PCA richness SEM.
+Path coefficients were standardised; standard errors and 95% confidence intervals
+were obtained by parametric bootstrap (1,000 resamples, BCa intervals).
+Global model fit was evaluated using the chi-squared statistic, Comparative Fit
+Index (CFI ≥ 0.95), Root Mean Square Error of Approximation (RMSEA ≤ 0.08),
+and Standardised Root Mean Square Residual (SRMR ≤ 0.08).
+
+---
+
+### Supplementary methods
+
+#### S1. Principal component analyses
+
+PCA was applied separately to the cover, soil, and topography variable blocks.
+All variables were centred and scaled to unit variance before decomposition
+(`prcomp(scale. = TRUE)`).
+Snow cover in 1976 is a binary variable (0/1 indicating presence of glacier
+ice on a 1976 Landsat image); it was treated as numeric for PCA, consistent
+with its role as an ordinal terrain descriptor.
+The proportion of total variance explained by PC1 and the variable loadings are
+reported for each block (see biplots, above).
+
+To assess whether the dominant PCA axes were consistent across the two glacier
+systems (Nubra and Tsomoriri), we conducted two supplementary ordination
+analyses: (i) **stratified PCAs** — independent PCAs within each location;
+(ii) **partial PCAs** — `vegan::rda(mat ~ Condition(Location))`, which removes
+the between-location centroid from the variable matrix before decomposition.
+The proportion of total variance attributable to Location is reported as
+R² from the partial RDA.
+All three sets of PC1 scores (global, stratified, partial) were visualised as
+biplots and compared. Global scores were retained for the core vegetation-soil
+SEM, whereas the final microbial richness SEM used partial-PCA scores to focus
+on within-location chronosequence structure.
+
+#### S2. Rarefaction and diversity estimation
+
+Read counts were pooled across microhabitat samples (Bulk Soil, Soil Crust,
+Moss, Lichen, Plant) belonging to the same plot by summation of raw counts.
+The minimum pooled read depth across all plots set the rarefaction target
+(reported in the `sem-setup` chunk output).
+Genus-level observed richness (number of genera with count > 0) and Shannon H'
+were computed on each of 999 subsampled count matrices drawn without replacement
+(`vegan::rrarefy`, seed 42), then averaged across iterations to give a
+stable per-plot estimate.
+
+#### S3. SEM model equations
+
+The core model (4 nodes) estimated the following regression equations:
+
+$$
+\text{VegPC1} \sim \beta_{a1} \cdot \text{Dist}_z + \beta_{a2} \cdot \text{TopoPC1}
+$$
+$$
+\text{SoilPC1} \sim \beta_b \cdot \text{VegPC1} + \beta_{c1} \cdot \text{Dist}_z + \beta_{c2} \cdot \text{TopoPC1}
+$$
+
+The extended model added microbial diversity as terminal outcomes:
+
+$$
+\text{Richness}_{16S} \sim \beta_{d1} \cdot \text{VegPC1} + \beta_{d2} \cdot \text{SoilPC1}
+$$
+
+with an analogous equation for ITS richness and for Shannon H'.
+Direct paths from Distance or TopoPC1 to microbial outcomes were excluded in the
+primary microbial SEMs to avoid a saturated specification and to match the
+a priori chronosequence hypothesis that environmental effects on microbial
+diversity are mediated through vegetation colonisation and soil development.
+For the final microbial richness model, the full partial-PCA richness SEM was
+further trimmed by removing direct pathways with *p* > 0.10, and the trimmed
+model was compared with the full partial-PCA model using AIC, BIC, global fit
+indices, and outcome R².
+Residuals of the two marker-specific outcomes (bacteria and fungi) were allowed
+to covary freely (`~~`), reflecting unmeasured shared environmental drivers.
+
+Indirect effects were computed as products of labelled path coefficients
+(e.g., Distance → Vegetation → Soil = $\hat\beta_{a1} \times \hat\beta_b$)
+and bootstrapped alongside direct effects.
+
+#### S4. Sensitivity analyses and model specification
+
+Two additional model specifications were fitted to assess robustness to the
+treatment of between-location variance:
+
+- **Spec 1 (partial PCA)**: PC1 scores for VegPC1, SoilPC1, and TopoPC1 were
+  extracted from partial RDAs conditioning on Location, removing between-location
+  centroid shifts from all composites. Signs were aligned with the corresponding
+  global PC1 (negated if Pearson r < 0).
+- **Spec 2 (global PCA + Location)**: Global PC1 scores were retained and
+  Location (binary dummy: Nubra = 1, Tsomoriri = 0) was added as an explicit
+  exogenous predictor in all regression equations.
+
+#### S5. Parsimony testing
+
+```{r parsimony-test, message=FALSE, warning=FALSE}
+# ── AIC comparison across all core SEM specifications ────────────────────────
+aic_tbl <- tibble(
+  Specification = c(
+    "Global PCA (core)",
+    "Partial PCA (core)",
+    "Global PCA + Location (core)"
+  ),
+  AIC  = c(AIC(sem_fit), AIC(sem_partial), AIC(sem_loc)),
+  BIC  = c(BIC(sem_fit), BIC(sem_partial), BIC(sem_loc))
+) %>%
+  mutate(
+    delta_AIC = round(AIC - min(AIC), 2),
+    delta_BIC = round(BIC - min(BIC), 2),
+    AIC = round(AIC, 2),
+    BIC = round(BIC, 2)
+  ) %>%
+  arrange(AIC)
+
+aic_tbl %>%
+  kable(caption = paste0(
+    "AIC and BIC for the three core SEM specifications (4-node model). ",
+    "delta = difference from best-fitting model. ",
+    "Models within delta AIC < 2 are considered equivalent."
+  )) %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+
+# ── Likelihood-ratio test: is Location a significant addition? ────────────────
+# Compare global PCA (nested in global+Location via constraint a3=c3=0)
+# Note: both must be fitted by ML (estimator="ML"), which they are.
+cat("\nLRT: Global PCA vs Global PCA + Location\n")
+lrt_loc <- lavTestLRT(sem_fit, sem_loc)
+print(lrt_loc)
+
+# ── Trimmed model: drop non-significant direct env paths from core SEM ────────
+# A parsimonious model retains only paths with p < 0.10 in the full model.
+sig_paths <- parameterEstimates(sem_fit) %>%
+  filter(op == "~", pvalue < 0.10) %>%
+  mutate(path_str = paste0(lhs, " ~ ", rhs))
+
+cat("\nPaths retained in trimmed model (p < 0.10):\n")
+print(sig_paths$path_str)
+
+sem_model_trim <- paste(
+  "VegPC1  ~",  paste(
+    sig_paths %>% filter(lhs == "VegPC1")  %>% pull(rhs), collapse = " + "
+  ),
+  "\nSoilPC1 ~", paste(
+    sig_paths %>% filter(lhs == "SoilPC1") %>% pull(rhs), collapse = " + "
+  )
+)
+
+cat("\nTrimmed model:\n", sem_model_trim, "\n")
+
+# Guard: only fit if both equations have at least one predictor
+if (all(c("VegPC1", "SoilPC1") %in% sig_paths$lhs)) {
+  sem_trim <- sem(
+    sem_model_trim,
+    data      = sem_data,
+    estimator = "ML",
+    se        = "bootstrap",
+    bootstrap = 1000
+  )
+
+  cat("\nTrimmed model fit:\n")
+  print(round(fitMeasures(sem_trim, c("chisq","df","pvalue","cfi","rmsea","srmr")), 3))
+
+  cat("\nLRT: Full core SEM vs trimmed model\n")
+  # Trimmed is nested within full if only paths are removed (no new constraints)
+  tryCatch(
+    print(lavTestLRT(sem_trim, sem_fit)),
+    error = function(e) cat("LRT not applicable (models not nested):", conditionMessage(e), "\n")
+  )
+
+  cat("\nAIC comparison (full vs trimmed):\n")
+  print(tibble(
+    Model = c("Full (core)", "Trimmed"),
+    AIC   = round(c(AIC(sem_fit), AIC(sem_trim)), 2),
+    BIC   = round(c(BIC(sem_fit), BIC(sem_trim)), 2)
+  ))
+} else {
+  cat("One or both SoilPC1/VegPC1 equations have no retained predictors — trimmed model skipped.\n")
+}
+```
